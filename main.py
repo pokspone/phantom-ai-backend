@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Tuple
 from collections import Counter
-import math
+import os
 
 app = FastAPI()
 
@@ -21,7 +21,7 @@ class PredictionRequest(BaseModel):
     history: List[str] = []
     coins: int = 0
 
-# الأوزان الأساسية النظرية لعجلة المزرعة بناءً على قيمة المضاعفات (الأقل مضاعفاً أكثر احتمالاً للظهور)
+# الأوزان الأساسية النظرية لعجلة المزرعة بناءً على قيمة المضاعفات
 FARM_ITEMS_META: Dict[str, Dict] = {
     "🍅 طماطم (×5)": {"mult": 5, "base_weight": 19.0, "tier": "common"},
     "🌽 ذرة (×5)": {"mult": 5, "base_weight": 19.0, "tier": "common"},
@@ -41,10 +41,7 @@ def clean_history_item(raw_item: str) -> str:
     return cleaned
 
 def check_statistical_warnings(clean_hist: List[str]) -> Tuple[bool, str]:
-    """
-    فحص تكرار النتيجة 5 مرات متتالية أو وجود انحراف حاد في العينة.
-    لا يفترض أن الجولة القادمة يجب أن تختلف حتمًا، بل يحذر من انخفاض موثوقية النمط.
-    """
+    """فحص تكرار النتيجة 5 مرات متتالية أو وجود انحراف حاد في العينة"""
     if len(clean_hist) >= 5:
         last_five = clean_hist[-5:]
         if all(x == last_five[0] for x in last_five):
@@ -55,12 +52,7 @@ def check_statistical_warnings(clean_hist: List[str]) -> Tuple[bool, str]:
     return False, "🟢 التوزيع الإحصائي ضمن الحدود الطبيعية."
 
 def analyze_farm_top5(clean_hist: List[str]) -> Tuple[str, str, str]:
-    """
-    حساب أقوى 5 توقعات لعجلة المزرعة بناءً على:
-    1. الوزن الأساسي للمضاعف (Base Probability).
-    2. التكرار الفعلي في الهيستوري (Empirical Frequency).
-    3. الفجوة منذ آخر ظهور (Lag / Gap Analysis) مع منع الجزم المطلق.
-    """
+    """حساب أقوى 5 توقعات لعجلة المزرعة بناءً على الأوزان والتكرار والفجوة الزمنية"""
     n = len(clean_hist)
     counts = Counter(clean_hist)
     scores: Dict[str, float] = {}
@@ -72,33 +64,26 @@ def analyze_farm_top5(clean_hist: List[str]) -> Tuple[str, str, str]:
             continue
 
         observed_count = counts.get(item, 0)
-        observed_freq = observed_count / n
 
-        # حساب الفجوة منذ آخر ظهور للعنصر في السجل
         if item in clean_hist:
             last_idx = len(clean_hist) - 1 - clean_hist[::-1].index(item)
             gap = len(clean_hist) - 1 - last_idx
         else:
             gap = n
 
-        # دمج بايزي مبسط (Laplace / Empirical Bayes Smoothing) بين الوزن الأساسي والتكرار المشاهد
-        alpha = 5.0  # معامل تنعيم لمنع القفزات العشوائية عند قلة البيانات
+        alpha = 5.0
         smoothed_prob = (observed_count + alpha * base_prob) / (n + alpha)
 
-        # تعديل طفيف بناءً على دورة الغياب (بدون افتراض حتمية الظهور)
         expected_cycle = 1.0 / max(base_prob, 0.01)
         cycle_factor = 1.0 + min(0.35, (gap / expected_cycle) * 0.15)
 
-        # إذا تكرر نفس العنصر في آخر جولتين، نخفض وزنه قليلاً لتنويع التغطية في الخمس خانات
         recent_penalty = 0.85 if (n >= 2 and clean_hist[-1] == item and clean_hist[-2] == item) else 1.0
 
         scores[item] = smoothed_prob * cycle_factor * recent_penalty
 
-    # تطبيع النتائج إلى نسب مئوية مجموعها 100%
     total_score = sum(scores.values()) or 1.0
     normalized = {k: (v / total_score) * 100.0 for k, v in scores.items()}
 
-    # ترتيب العناصر تنازلياً واختيار أعلى 5
     sorted_top5 = sorted(normalized.items(), key=lambda x: x[1], reverse=True)[:5]
 
     rank_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
@@ -108,8 +93,6 @@ def analyze_farm_top5(clean_hist: List[str]) -> Tuple[str, str, str]:
         top5_sum += prob
         lines.append(f"{rank_emojis[idx]} {item_name} — احتمال {prob:.1f}%")
 
-    # تقييم تاريخي مصغر (Walk-forward Top-5 Hit Rate) إذا كان السجل كافياً
-    hit_info = f"تغطية الخمس خانات: {top5_sum:.1f}%"
     if n >= 4:
         hits = 0
         trials = 0
@@ -117,7 +100,7 @@ def analyze_farm_top5(clean_hist: List[str]) -> Tuple[str, str, str]:
             sub_hist = clean_hist[:i]
             sub_counts = Counter(sub_hist)
             sub_scores = {
-                k: ((sub_counts.get(k, 0) + 5.0 * (v["base_weight"]/100.0)) / (len(sub_hist) + 5.0))
+                k: ((sub_counts.get(k, 0) + 5.0 * (v["base_weight"] / 100.0)) / (len(sub_hist) + 5.0))
                 for k, v in FARM_ITEMS_META.items()
             }
             sub_top5 = [k for k, _ in sorted(sub_scores.items(), key=lambda x: x[1], reverse=True)[:5]]
@@ -133,14 +116,8 @@ def analyze_farm_top5(clean_hist: List[str]) -> Tuple[str, str, str]:
     return "<br>".join(lines), conf_str, log_note
 
 def analyze_poker_dual(clean_hist: List[str]) -> Tuple[str, str, str]:
-    """
-    تحليل لعبة البوكر (3 كراسي A, B, C) باستخدام مصفوفة الانتقال (Markov Transition)
-    وتوزيع التكرار لإخراج: توقع أساسي + توقع بديل.
-    """
+    """تحليل لعبة البوكر (3 كراسي A, B, C) لإخراج توقع أساسي + توقع بديل"""
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
-    n = len(clean_hist)
-
-    # تطبيع أسماء الكراسي في السجل
     norm_hist = []
     for h in clean_hist:
         if "A" in h:
@@ -162,7 +139,6 @@ def analyze_poker_dual(clean_hist: List[str]) -> Tuple[str, str, str]:
         )
 
     counts = Counter(norm_hist)
-    # حساب الانتقالات من الكرسي الأخير إلى الكرسي الذي يليه في السجل
     last_chair = norm_hist[-1]
     transition_counts = Counter()
     total_transitions = 0
@@ -198,9 +174,7 @@ def analyze_poker_dual(clean_hist: List[str]) -> Tuple[str, str, str]:
     return pred_html, conf_str, log_note
 
 def analyze_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
-    """
-    تحليل Dragon & Tiger بناءً على السجل الفعلي وحساب احتمالات الانتقال والتوازن.
-    """
+    """تحليل Dragon & Tiger بناءً على السجل الفعلي وحساب احتمالات الانتقال والتوازن"""
     norm_hist = []
     for h in clean_hist:
         if "تنين" in h:
@@ -224,7 +198,6 @@ def analyze_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
     t_count = counts.get("🐅 تايجر", 0)
     tie_count = counts.get("🤝 تعادل", 0)
 
-    # تحليل التتابع (هل السيرفر يميل لتكرار الفائز أم التبديل؟)
     switches = 0
     repeats = 0
     non_tie = [x for x in norm_hist if x != "🤝 تعادل"]
@@ -237,7 +210,6 @@ def analyze_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
     last_non_tie = non_tie[-1] if non_tie else "🐉 تنين"
     opposite = "🐅 تايجر" if last_non_tie == "🐉 تنين" else "🐉 تنين"
 
-    # حساب الاحتمال الموزون
     if switches > repeats:
         favored = opposite
         pattern_type = "نمط تبادلي (Chop)"
@@ -248,7 +220,7 @@ def analyze_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
         favored = "🐅 تايجر" if d_count > t_count else "🐉 تنين"
         pattern_type = "نمط متوازن"
 
-    total_ decisive = max(1, d_count + t_count)
+    total_decisive = max(1, d_count + t_count)
     imbalance = abs(d_count - t_count) / total_decisive
     est_prob = min(68.0, 50.0 + (imbalance * 12.0) + (abs(switches - repeats) * 1.5))
 
@@ -266,10 +238,8 @@ def predict(req: PredictionRequest):
         game = req.game_type.upper().strip()
         clean_hist = [clean_history_item(h) for h in req.history if h and h.strip()]
 
-        # 1. فحص تكرار النتيجة 5 مرات أو انخفاض الموثوقية
         is_warning, warning_msg = check_statistical_warnings(clean_hist)
 
-        # 2. تشغيل المحرك الإحصائي المخصص لكل لعبة بشكل مستقل تماماً
         if "FARM" in game:
             pred_html, conf_str, log_note = analyze_farm_top5(clean_hist)
         elif "POKER" in game:
@@ -279,7 +249,6 @@ def predict(req: PredictionRequest):
         else:
             pred_html, conf_str, log_note = "يرجى اختيار لعبة صالحة.", "--%", "[ERROR] Unknown game"
 
-        # في حال وجود تحذير تكرار 5 مرات، ندمج التحذير مع التحليل دون إخفاء البيانات
         if is_warning:
             pred_html = f"<span style='color:#fca5a5;'>{warning_msg}</span><br><hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
             safe_amount = int(req.coins * 0.03) if req.coins > 0 else 0
@@ -308,7 +277,12 @@ def predict(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical Engine v117.0 Active",
+        "status": "Phantom Statistical Engine v117.1 Active",
         "data_source": "User-Recorded Round History (Empirical Bayes & Markov Analysis)",
         "developer": "MR"
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
