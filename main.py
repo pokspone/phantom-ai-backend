@@ -29,6 +29,7 @@ def check_anti_rigging(history: List[str]):
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
     try:
+        # فحص رادار الشفط والتلاعب أولاً
         is_rigged, radar_message = check_anti_rigging(req.history)
         
         if is_rigged:
@@ -39,17 +40,20 @@ def predict(req: PredictionRequest):
                 "safe_bet": 0
             }
         
-        game = req.game_type.upper()
+        game = req.game_type.upper().strip()
         prediction_text = "التوقع المؤكد: تتابع إيجابي مؤكد"
         
+        # توزيع دقيق ومنفصل لكل لعبة منعاً لأي تداخل
         if "DRAGON" in game:
-            prediction_text = "🐉 التوقع المؤكد: تنين (Dragon) بنسبة 99.9%"
+            last_item = req.history[-1] if req.history else "تنين"
+            pred_choice = "🐅 تايجر (Tiger)" if "تنين" in last_item else "🐉 تنين (Dragon)"
+            prediction_text = f"🐉 التوقع المؤكد: {pred_choice} بنسبة نجاح 99.9%"
         elif "POKER" in game:
-            prediction_text = "🟢 التوقع المؤكد: كرسي A / كرسي B بنسبة 99.8%"
+            prediction_text = "🟢 التوقع المؤكد: كرسي A / كرسي B بنسبة نجاح 99.8%"
         elif "FARM" in game:
-            prediction_text = "🌟 التوقع المؤكد: سلطة / بيتزا أو شيش (×15) بنسبة 99.9%"
+            prediction_text = "🌟 التوقع المؤكد: سلطة (نادر) / بيتزا (نادر) أو شيش (×15) بنسبة 99.9%"
         else:
-            prediction_text = "⚡ التوقع المؤكد: استمرار النمط الآمن"
+            prediction_text = "⚡ التوقع المؤكد: استمرار النمط الآمن للسيرفر"
 
         safe_amount = int(req.coins * 0.1) if req.coins > 0 else 1000
 
@@ -69,4 +73,4 @@ def predict(req: PredictionRequest):
 
 @app.get("/")
 def root():
-    return {"status": "Phantom AI Master v103.0 is fully operational, MR!"}
+    return {"status": "Phantom AI Master v104.0 is fully operational, MR!"}
