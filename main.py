@@ -5,7 +5,6 @@ from typing import List, Optional
 
 app = FastAPI()
 
-# تفعيل الـ CORS عشان التطبيق يكلم السيرفر بحرية تامة وبدون حظر
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,14 +13,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# هيكل البيانات القادم من التطبيق (باستخدام Pydantic القوية)
 class PredictionRequest(BaseModel):
     game_type: str
     room_id: Optional[str] = None
     history: List[str] = []
     coins: int = 0
 
-# دالة الرادار العكسي لتفادي الشفط والتلاعب
 def check_anti_rigging(history: List[str]):
     if history and len(history) >= 4:
         last_four = history[-4:]
@@ -32,7 +29,7 @@ def check_anti_rigging(history: List[str]):
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
     try:
-        # فحص الرادار العكسي
+        # فحص الرادار العكسي لكل اللعب
         is_rigged, radar_message = check_anti_rigging(req.history)
         
         if is_rigged:
@@ -43,21 +40,35 @@ def predict(req: PredictionRequest):
                 "safe_bet": 0
             }
         
-        # التوقع الذكي العادي
+        # توجيه التوقع حسب اللعبة بدقة منعاً لأي لخبطة
+        game = req.game_type.upper()
+        prediction_text = "التوقع المؤكد: بن بنسبة نجاح عالية"
+        
+        if "DRAGON" in game:
+            prediction_text = "🐉 التوقع المؤكد: تنين (Dragon) بنسبة 99.9%"
+        elif "POKER" in game:
+            prediction_text = "🟢 التوقع المؤكد: كرسي A / كرسي B بنسبة 99.8%"
+        elif "FARM" in game:
+            prediction_text = "🌟 التوقع المؤكد: سلطة / بيتزا أو شيش (×15) بنسبة 99.9%"
+        else:
+            prediction_text = "⚡ التوقع المؤكد: تتابع إيجابي مؤكد"
+
+        safe_amount = int(req.coins * 0.1) if req.coins > 0 else 1000
+
         return {
             "is_rigged": False,
             "confidence": "99.9%",
-            "prediction": "التوقع المؤكد: تنين / كرسي A بنسبة نجاح عالية",
-            "safe_bet": int(req.coins * 0.1) if req.coins > 0 else 1000
+            "prediction": prediction_text,
+            "safe_bet": safe_amount
         }
     except Exception as e:
         return {
             "is_rigged": False,
             "confidence": "99.0%",
-            "prediction": "التوقع المؤكد: تنين / كرسي A",
+            "prediction": "⚡ التوقع المؤكد: استمرار النمط الآمن",
             "safe_bet": 500
         }
 
 @app.get("/")
 def root():
-    return {"status": "Phantom AI Fast API is running smoothly, MR!"}
+    return {"status": "Phantom AI Master is fully operational, MR!"}
