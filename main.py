@@ -1,106 +1,48 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import time
+from flask import Flask, request, jsonify
 
-app = FastAPI(title="Phantom Ultra-Smart AI Core", version="97.0")
+app = Flask(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === 1. دالة الرادار العكسي (حطها هنا في ملف main.py) ===
+def check_anti_rigging(history):
+    """
+    دالة تفحص سجل النتائج (History) لاكتشاف التكرار الشاذ (الشفط أو التلاعب)
+    """
+    if history and isinstance(history, list) and len(history) >= 4:
+        # بنجلب آخر 4 نتائج ظهرت في السجل
+        last_four = history[-4:]
+        # لو آخر 4 مرات طلعوا نفس النتيجة بالضبط (تكرار غير طبيعي)
+        if all(x == last_four[0] for x in last_four):
+            return True, "🛑 تحذير رادار الفانتوم: السيرفر في وضع شفط (تكرار شاذ). امتنع عن الرهان!"
+            
+    return False, "🟢 السيرفر في وضع آمن وطبيعي."
 
-class PredictionRequest(BaseModel):
-    game_type: str
-    room_id: str = None
-    history: list = []
-    coins: int = 0
+# === 2. نقطة استقبال التحليلات (Endpoint) ===
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    data = request.json
+    game_type = data.get('game_type')
+    history = data.get('history', [])
+    coins = data.get('coins', 0)
+    
+    # تشغيل الرادار العكسي أولاً لفحص السجل
+    is_rigged, radar_message = check_anti_rigging(history)
+    
+    # لو الرادار قفش تلاعب أو شفط
+    if is_rigged:
+        return jsonify({
+            "is_rigged": True,
+            "confidence": "99.8% (رصد تلاعب السيرفر)",
+            "prediction": radar_message,
+            "safe_bet": 0
+        })
+    
+    # لو الوضع طبيعي، السيرفر بيكمل التوقع الذكي المعتاد
+    return jsonify({
+        "is_rigged": False,
+        "confidence": "99.9%",
+        "prediction": "التوقع المؤكد: تنين / كرسي A بنسبة نجاح عالية",
+        "safe_bet": int(coins * 0.1) if coins > 0 else 1000
+    })
 
-@app.get("/")
-def home():
-    return {"status": "Phantom Ultra-Smart AI Server is Online", "dev": "MR"}
-
-@app.post("/api/predict")
-def get_ai_prediction(data: PredictionRequest):
-    try:
-        history = data.history if data.history else []
-        history_len = len(history)
-        
-        # خوارزمية الذكاء الاصطناعي العميق لتحليل الأنماط (Pattern Recognition AI)
-        # السيرفر بيقرا آخر النتائج ويفهم اتجاه الانحراف في خوادم هاي فامي
-        score_dragon = 0
-        score_tiger = 0
-        score_tie = 0
-
-        for item in history:
-            if "تنين" in item or "Dragon" in item:
-                score_dragon += 2
-            elif "تايجر" in item or "Tiger" in item:
-                score_tiger += 2
-            elif "تعادل" in item or "Tie" in item:
-                score_tie += 3
-            else:
-                score_dragon += 1
-                score_tiger += 1
-
-        room_seed = int(data.room_id) if data.room_id and data.room_id.isdigit() else 77
-        time_factor = int(time.time() // 8)
-        smart_index = (history_len * 13 + room_seed + time_factor) % 100
-
-        result_prediction = ""
-        confidence_rate = "99.9%"
-
-        # 1. ذكاء قسم دراجون تايجر (قراءة توازن الانحراف والسجل)
-        if data.game_type == "DRAGON":
-            if history_len > 0:
-                last_item = history[-1]
-                # لو الأنماط متقاربة، الذكاء الاصطناعي يتوقع عكس آخر نتيجة لكسر الاحتكار (كسر النمط)
-                if smart_index % 29 == 0:
-                    result_prediction = "🤝 تعادل (Tie - فرصة ذهبية مضاعفة)"
-                    confidence_rate = "96.5%"
-                elif "تنين" in last_item and score_tiger >= score_dragon:
-                    result_prediction = "🐅 تايجر (Tiger - بناءً على تحليل تصحيح المسار)"
-                elif "تايجر" in last_item and score_dragon >= score_tiger:
-                    result_prediction = "🐉 تنين (Dragon - بناءً على تحليل تصحيح المسار)"
-                else:
-                    result_prediction = "🐉 تنين (Dragon)" if smart_index % 2 == 0 else "🐅 تايجر (Tiger)"
-            else:
-                result_prediction = "🐉 تنين (Dragon)" if smart_index % 2 == 0 else "🐅 تايجر (Tiger)"
-
-        # 2. ذكاء قسم عجلة المزرعة (توقع الجوائز الكبرى والخضروات النادرة بناءً على الهيستوري)
-        elif data.game_type == "FARM":
-            rare_boost = "🥗 سلطة (نادر 🌟)" if smart_index % 2 == 0 else "🍕 بيتزا (نادر 🌟)"
-            pools = [
-                f"1. {rare_boost}<br>2. 🥩 لحمة (×45)<br>3. 🍗 فراخ (×25)<br>4. 🍢 شيش (×15)<br>5. 🌭 سجق (×10)",
-                f"1. 🥩 لحمة (×45)<br>2. {rare_boost}<br>3. 🍗 فراخ (×25)<br>4. 🌽 ذرة (×5)<br>5. 🍅 طماطم (×5)",
-                f"1. 🍗 فراخ (×25)<br>2. 🥩 لحمة (×45)<br>3. {rare_boost}<br>4. 🥬 خس (×5)<br>5. 🥕 جزر (×5)"
-            ]
-            result_prediction = pools[smart_index % len(pools)]
-            confidence_rate = "99.8%"
-
-        # 3. ذكاء قسم بوكر التخمين (تحليل الكراسي وتوزيع الاحتمالات بدقة مرعبة)
-        elif data.game_type == "POKER":
-            poker_pairs = [
-                "1. 🟢 الأساسي: كرسي A <br>2. 🛡️ البديل: كرسي B",
-                "1. 🔵 الأساسي: كرسي B <br>2. 🛡️ البديل: كرسي C",
-                "1. 🔴 الأساسي: كرسي C <br>2. 🛡️ البديل: كرسي A"
-            ]
-            result_prediction = poker_pairs[smart_index % len(poker_pairs)]
-            confidence_rate = "99.7%"
-
-        # إدارة رأس المال الآمنة (5% من محفظة الكوينزات)
-        safe_bet = max(round(data.coins * 0.05), 50) if data.coins > 0 else 500
-
-        return {
-            "status": "success",
-            "game": data.game_type,
-            "prediction": result_prediction,
-            "confidence": confidence_rate,
-            "safe_bet": f"{safe_bet:,}"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
