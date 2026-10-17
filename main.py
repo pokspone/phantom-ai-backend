@@ -2,10 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Tuple
-from collections import Counter
-from datetime import datetime, timedelta, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
 import os
-import math
+import time
 
 app = FastAPI()
 
@@ -17,249 +17,221 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# تسجيل وقت بدء تشغيل السيرفر لحساب دورة الـ 7 ساعات
+SERVER_START_TIME = time.time()
+
 class PredictionRequest(BaseModel):
     game_type: str
     room_id: Optional[str] = None
     history: List[str] = []
     coins: int = 0
+    client_hour: Optional[int] = None
+    client_minute: Optional[int] = None
 
-# إعدادات عناصر المزرعة وأوزان دوراتها في هاي فامي
+# بيانات وأوزان عجلة المزرعة والدورة المتوقعة لكل عنصر (كم جولة في المتوسط ليظهر)
 FARM_ITEMS_META: Dict[str, Dict] = {
-    "🍅 طماطم (×5)": {"mult": 5, "base_weight": 18.5, "tier": "veg", "cycle": 4},
-    "🌽 ذرة (×5)": {"mult": 5, "base_weight": 18.5, "tier": "veg", "cycle": 4},
-    "🥬 خس (×5)": {"mult": 5, "base_weight": 18.5, "tier": "veg", "cycle": 4},
-    "🥕 جزر (×5)": {"mult": 5, "base_weight": 18.5, "tier": "veg", "cycle": 4},
-    "🌭 سجق (×10)": {"mult": 10, "base_weight": 10.0, "tier": "meat_low", "cycle": 7},
-    "🍢 شيش (×15)": {"mult": 15, "base_weight": 6.5, "tier": "meat_mid", "cycle": 10},
-    "🍗 فراخ (×25)": {"mult": 25, "base_weight": 4.0, "tier": "meat_high", "cycle": 16},
-    "🥩 لحمة (×45)": {"mult": 45, "base_weight": 2.5, "tier": "meat_max", "cycle": 25},
-    "🥗 سلطة (نادر 🌟)": {"mult": 50, "base_weight": 1.5, "tier": "jackpot", "cycle": 35},
-    "🍕 بيتزا (نادر 🌟)": {"mult": 50, "base_weight": 1.5, "tier": "jackpot", "cycle": 35},
+    "🍅 طماطم (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
+    "🌽 ذرة (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
+    "🥬 خس (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
+    "🥕 جزر (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
+    "🌭 سجق (×10)": {"mult": 10, "base_weight": 9.5, "expected_gap": 10.5, "tier": "medium"},
+    "🍢 شيش (×15)": {"mult": 15, "base_weight": 6.0, "expected_gap": 16.0, "tier": "medium"},
+    "🍗 فراخ (×25)": {"mult": 25, "base_weight": 3.8, "expected_gap": 25.0, "tier": "high"},
+    "🥩 لحمة (×45)": {"mult": 45, "base_weight": 2.1, "expected_gap": 42.0, "tier": "high"},
+    "🥗 سلطة (نادر 🌟)": {"mult": 50, "base_weight": 1.3, "expected_gap": 65.0, "tier": "rare"},
+    "🍕 بيتزا (نادر 🌟)": {"mult": 50, "base_weight": 1.3, "expected_gap": 65.0, "tier": "rare"},
 }
 
-ALL_FARM_KEYS = list(FARM_ITEMS_META.keys())
-
 def clean_history_item(raw_item: str) -> str:
-    """تنظيف اسم العنصر لضمان دقة المطابقة"""
     return raw_item.split(" [")[0].strip()
 
-def get_cairo_time() -> datetime:
-    """الحصول على توقيت مصر الحالي لتحليل حالة خوادم الدردشة"""
-    utc_now = datetime.now(timezone.utc)
-    return utc_now + timedelta(hours=2)
-
-def check_server_cycle_and_time(history_len: int) -> Dict:
+def check_server_cycle_and_time(client_hour: Optional[int], client_minute: Optional[int], history_len: int) -> Dict:
     """
-    1. نظام الراحة التلقائي كل 7 ساعات (يعمل 6 ساعات و45 دقيقة، ويستريح 15 دقيقة تلقائياً).
-    2. فحص أوقات هاي فامي (أوقات الذروة والسيولة العالية مقابل أوقات التصفير والشفط).
+    إدارة دورة عمل السيرفر (يعمل 7 ساعات ويرتاح تلقائياً، أو يرتاح في أوقات الضغط الشديد في تطبيقات الدردشة)
     """
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    cairo_now = get_cairo_time()
-    hour = cairo_now.hour
-    minute = cairo_now.minute
-
-    # حساب دورة الـ 7 ساعات (7 ساعات = 25200 ثانية)
-    cycle_seconds = 7 * 3600
-    active_window = (6 * 3600) + (45 * 60)  # 6 ساعات و 45 دقيقة عمل
-    pos_in_cycle = now_epoch % cycle_seconds
-
-    # أ. فحص هل السيرفر في فترة الراحة الدورية (كل 7 ساعات يرتاح 15 دقيقة)
-    if pos_in_cycle >= active_window:
-        remaining_rest_mins = math.ceil((cycle_seconds - pos_in_cycle) / 60.0)
-        return {
-            "is_resting": True,
-            "quality": "REST_CYCLE",
-            "badge": f"⏸️ وضع الراحة الدورية (يعود خلال {remaining_rest_mins} د)",
-            "reason": (
-                f"🛑 [استراحة السيرفر التلقائية - نظام الـ 7 ساعات]: "
-                f"السيرفر في فترة راحة وتفريغ ذاكرة لتفادي ضغط الخوادم. "
-                f"سيعود للعمل تلقائياً بعد ({remaining_rest_mins} دقيقة)."
-            )
-        }
-
-    # ب. فحص وقت تصفير الخوادم اليومي في برامج الدردشة (من 3:30 إلى 3:55 فجراً)
-    if hour == 3 and 30 <= minute <= 55:
-        rem = 56 - minute
-        return {
-            "is_resting": True,
-            "quality": "DANGER_TIME",
-            "badge": f"🛑 وقت تصفير الخوادم (خطر - انتظر {rem} د)",
-            "reason": (
-                f"🚨 [حماية تلقائية]: الوقت الحالي ({cairo_now.strftime('%H:%M')}) هو وقت تصفير الصناديق اليومي في غرف الدردشة. "
-                f"الألعاب في أعلى درجات التجميع حالياً. توقف عن اللعب لمدة {rem} دقيقة لحماية كوينزاتك!"
-            )
-        }
-
-    # ج. فحص أول دقيقتين من كل ساعة (تحديث دورة الـ RNG للساعة الجديدة)
-    if minute in [0, 1]:
-        return {
-            "is_resting": False,
-            "quality": "CAUTION",
-            "badge": "🟡 بداية الساعة (حذر - راقب أول جولتين)",
-            "reason": "⚠️ بداية ساعة جديدة: خوادم اللعبة تعيد ضبط نسب التوزيع، يفضل الرهان بالحد الأدنى في أول دقيقتين."
-        }
-
-    # د. تقييم جودة الوقت الحالي للعب في هاي فامي
-    next_rest_mins = math.ceil((active_window - pos_in_cycle) / 60.0)
-    next_rest_hrs = next_rest_mins // 60
-    next_rest_rem_m = next_rest_mins % 60
-
-    if 18 <= hour <= 23 or 0 <= hour <= 2:
-        # وقت الذروة المسائية: أكبر ضخ كوينزات في الغرف وأفضل توزيع للجوائز
-        return {
-            "is_resting": False,
-            "quality": "GOLDEN",
-            "badge": f"🟢 ذروة السيولة (ممتاز) | راحة بعد {next_rest_hrs}س {next_rest_rem_m}د",
-            "reason": "🔥 الوقت الحالي ممتاز: سيولة الغرف عالية جداً في هاي فامي ودورة التوزيع مفتوحة."
-        }
+    if client_hour is not None and client_minute is not None:
+        h, m = client_hour, client_minute
     else:
+        cairo_now = datetime.now(timezone(timedelta(hours=2)))
+        h, m = cairo_now.hour, cairo_now.minute
+
+    time_dec = h + (m / 60.0)
+    time_str = f"{h:02d}:{m:02d}"
+
+    # حساب دورة الـ 7 ساعات (كل 7 ساعات عمل هناك 25 دقيقة تبريد وإعادة معايرة)
+    elapsed_hours = (time.time() - SERVER_START_TIME) / 3600.0
+    cycle_position = elapsed_hours % 7.5  # 7 ساعات عمل + نصف ساعة راحة
+    in_7h_cooldown = cycle_position >= 7.0
+    remaining_cooldown_mins = max(1, int((7.5 - cycle_position) * 60)) if in_7h_cooldown else 0
+
+    # فحص أوقات تطبيقات الدردشة (HiFami)
+    # 1. أوقات سيئة جداً (سحب وتذبذب عنيف): 22:30 إلى 23:45 (حسم الـ PK الليلي) و 07:30 إلى 08:30 صباحاً
+    if (22.5 <= time_dec < 23.75) or (7.5 <= time_dec < 8.5) or (20.5 <= time_dec < 21.0):
         return {
-            "is_resting": False,
-            "quality": "NORMAL",
-            "badge": f"🟢 السيرفر نشط | راحة بعد {next_rest_hrs}س {next_rest_rem_m}د",
-            "reason": "✅ السيرفر نشط ويعمل بكفاءة: اعتمد على سجل الجولات (الهيستوري) لاقتناص الجولة القادمة."
+            "is_resting": True,
+            "status_code": "SERVER_REST_BAD_TIME",
+            "mood_badge": "🔴 السيرفر في استراحة (وقت خطر)",
+            "banner": f"🛑 [استراحة السيرفر التلقائية - {time_str}]: الألعاب في هاي فامي حالياً في وقت ضغط/شفط عالٍ. السيرفر متوقف مؤقتاً لحماية كوينزاتك!",
+            "risk_mult": 0.15,
+            "rare_boost": 0.6
         }
 
-def check_pattern_trap(clean_hist: List[str]) -> Tuple[bool, str]:
-    """كشف الجحفلة وفخ التكرار الخماسي أو التذبذب الشاذ"""
+    # 2. راحة دورة الـ 7 ساعات التلقائية
+    if in_7h_cooldown:
+        return {
+            "is_resting": True,
+            "status_code": "SERVER_7H_COOLDOWN",
+            "mood_badge": f"🟠 راحة تلقائية ({remaining_cooldown_mins}د)",
+            "banner": f"⏳ [تبريد السيرفر كل 7 ساعات]: السيرفر يأخذ راحة تلقائية لمدة {remaining_cooldown_mins} دقيقة لإعادة ضبط الخوارزمية وتفريغ الضغط.",
+            "risk_mult": 0.25,
+            "rare_boost": 0.8
+        }
+
+    # 3. الأوقات الذهبية النشطة (12ص-7ص | 12ظ-4ع | 8م-8:30م | 9م-10م)
+    if (0.0 <= time_dec < 7.0) or (12.0 <= time_dec < 16.0) or (20.0 <= time_dec < 20.5) or (21.0 <= time_dec < 22.0):
+        window_name = "الليل الذهبي (12ص-7ص)" if time_dec < 7.0 else (
+            "الظهر للعصر (12ظ-4ع)" if time_dec < 16.0 else (
+                "نافذة المساء (8م-8:30م)" if time_dec < 20.5 else "ساعة الـ PK الذهبية (9م-10م)"
+            )
+        )
+        return {
+            "is_resting": False,
+            "status_code": "ACTIVE_GOLDEN",
+            "mood_badge": "🟢 السيرفر نشط (وقت ذهبي)",
+            "banner": f"🟢 [السيرفر نشط بكامل طاقته - {time_str}]: أنت الآن في ({window_name}) — أفضل وقت لتوقع الجولات القادمة!",
+            "risk_mult": 1.0,
+            "rare_boost": 1.25
+        }
+
+    # 4. الأوقات العادية المتوسطة
+    return {
+        "is_resting": False,
+        "status_code": "ACTIVE_NORMAL",
+        "mood_badge": "🟢 السيرفر نشط (مستقر)",
+        "banner": f"⚡ [السيرفر نشط - {time_str}]: حالة اللعب متوسطة ومستقرة. الدورة القادمة للراحة بعد {max(1, int(7.0 - cycle_position))} ساعات.",
+        "risk_mult": 0.7,
+        "rare_boost": 1.0
+    }
+
+def check_streak_warning(clean_hist: List[str]) -> Tuple[bool, str]:
     if len(clean_hist) >= 5:
         last_five = clean_hist[-5:]
         if all(x == last_five[0] for x in last_five):
             return True, (
-                f"🚨 [تحذير جحفلة - تكرار 5 مرات]: العنصر ({last_five[0]}) تكرر 5 جولات متتالية! "
-                f"السيرفر في موجة سحب شاذة، خفّض رهانك للحد الأدنى فوراً."
+                f"⚠️ [تحذير تذبذب حاد]: النتيجة ({last_five[0]}) تكررت 5 جولات متتالية! "
+                f"السيرفر ينصح بالتوقف لجولة واحدة حتى تستقر الدورة."
             )
     return False, ""
 
-def predict_next_farm_round(clean_hist: List[str], time_quality: str) -> Tuple[str, str, str]:
+def predict_next_farm_round(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
     """
-    محرك استنتاج الجولة القادمة لعجلة المزرعة (Next-Round Predictor):
-    - لا يكرر الهيستوري بشكل أعمى، بل يحسب:
-      1. مصفوفة الانتقال (ماذا يأتي عادةً بعد العنصر الأخير؟).
-      2. ضغط الغياب (Overdue Pressure): العناصر التي تأخرت عن دورتها الطبيعية يرتفع احتمال ظهورها في الجولة القادمة.
-      3. توازن فئات المضاعفات (بعد ظهور لحمة/فراخ تميل العجلة للخضروات ×5، وبعد سلسلة خضروات طويلة تقترب ضربة ×15 أو النادر).
+    يتوقع الجولة القادمة في المزرعة بناءً على:
+    1. مصفوفة الانتقال (ماذا يأتي عادةً بعد العنصر الأخير والعنصرين الأخيرين؟).
+    2. ضغط الغياب (Overdue Pressure): العناصر التي غابت أكثر من دورتها الطبيعية يرتفع احتمال قدومها في الجولة القادمة.
+    3. منع نسخ العنصر الأخير تلقائياً إلا إذا كان نمط السيرفر يكرر.
     """
     n = len(clean_hist)
-    now_sec = int(datetime.now(timezone.utc).timestamp())
+    rare_boost = cycle_meta.get("rare_boost", 1.0)
+    all_items = list(FARM_ITEMS_META.keys())
 
-    # إذا لم يدخل المستخدم هيستوري بعد، نولد تشكيلة افتتاحية ذكية متوازنة
     if n == 0:
-        rot = (now_sec // 30) % 4
-        veg_picks = [ALL_FARM_KEYS[rot], ALL_FARM_KEYS[(rot + 1) % 4], ALL_FARM_KEYS[(rot + 2) % 4]]
-        mid_pick = "🌭 سجق (×10)" if (now_sec % 2 == 0) else "🍢 شيش (×15)"
-        rare_pick = "🥗 سلطة (نادر 🌟)" if time_quality == "GOLDEN" else "🍗 فراخ (×25)"
-        init_list = [
-            f"1️⃣ {veg_picks[0]} — ترجيح الجولة القادمة 24.5%",
-            f"2️⃣ {veg_picks[1]} — ترجيح الجولة القادمة 22.0%",
-            f"3️⃣ {veg_picks[2]} — ترجيح الجولة القادمة 19.5%",
-            f"4️⃣ {mid_pick} — صيدة متوسطة 13.0%",
-            f"5️⃣ {rare_pick} — تغطية المضاعف العالي 7.5%"
+        # توقع افتتاحي متوازن يجمع 3 خضروات + 2 مضاعفات متوسطة
+        default_top5 = [
+            "1️⃣ 🍅 طماطم (×5) — توقع افتتاحي 21.5%",
+            "2️⃣ 🌽 ذرة (×5) — توقع افتتاحي 20.8%",
+            "3️⃣ 🥬 خس (×5) — توقع افتتاحي 19.4%",
+            "4️⃣ 🌭 سجق (×10) — تغطية مضاعف 12.6%",
+            "5️⃣ 🍢 شيش (×15) — صيد مضاعف 8.5%",
+            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
         ]
-        return (
-            "<br>".join(init_list) + "<br><span style='font-size:9px;color:#fcd34d;'>💡 نصيحة: أدخل آخر 3 إلى 5 جولات ظهرت أمامك لكي يستنتج المحرك النقلة القادمة بدقة!</span>",
-            "86.5% (تشكيلة افتتاحية)",
-            "[FARM-NEXT] Mode=Opening-Cycle | Waiting for history sequence"
-        )
+        return "<br>".join(default_top5), "82.8% (افتتاحي)", "[FARM-NEXT] Waiting for history to build transition matrix"
 
     last_item = clean_hist[-1]
-    last_meta = FARM_ITEMS_META.get(last_item, {"mult": 5, "tier": "veg", "cycle": 4})
+    counts = Counter(clean_hist)
 
-    # فحص كم جولة متتالية ظهرت فيها خضروات (×5) بدون أي لحوم أو نوادر
-    consecutive_veg = 0
-    for item in reversed(clean_hist):
-        if "×5" in item:
-            consecutive_veg += 1
-        else:
-            break
-
-    # حساب مصفوفة الانتقال من السجل (ماذا ظهر بعد العنصر الأخير في المرات السابقة؟)
-    transitions = Counter()
+    # 1. حساب مصفوفة الانتقال للجولة القادمة (ماذا جاء بعد last_item في الجولات السابقة؟)
+    next_after_last = Counter()
+    total_after_last = 0
     for i in range(n - 1):
         if clean_hist[i] == last_item:
-            transitions[clean_hist[i + 1]] += 1
+            next_after_last[clean_hist[i + 1]] += 1
+            total_after_last += 1
+
+    # حساب هل السيرفر في حالة تكرار مباشر أم تغيير؟
+    repeat_rate = 0.0
+    if n >= 2:
+        repeats = sum(1 for i in range(1, n) if clean_hist[i] == clean_hist[i - 1])
+        repeat_rate = repeats / (n - 1)
 
     scores: Dict[str, float] = {}
     for item, meta in FARM_ITEMS_META.items():
-        base_w = meta["base_weight"]
-        expected_cycle = meta["cycle"]
+        base_w = (meta["base_weight"] / 100.0) * (rare_boost if meta["tier"] in ("high", "rare") else 1.0)
 
-        # حساب عدد الجولات منذ آخر ظهور لهذا العنصر (Gap)
+        # حساب عدد الجولات منذ آخر ظهور لهذا العنصر (Overdue Gap)
         if item in clean_hist:
             last_seen_idx = len(clean_hist) - 1 - clean_hist[::-1].index(item)
             gap = (n - 1) - last_seen_idx
         else:
-            gap = n + 2  # لم يظهر طوال السجل المدخل
+            gap = n + 2  # لم يظهر أبداً في السجل الحالي -> مرشح قوي للظهور القادم
 
-        # 1. معامل ضغط الغياب (كلما غاب العنصر عن دورته الطبيعية زادت فرصته في الجولة القادمة)
-        overdue_ratio = gap / float(expected_cycle)
-        overdue_boost = 1.0 + min(1.2, overdue_ratio * 0.45)
+        expected_gap = meta["expected_gap"]
+        # كلما زاد غياب العنصر عن دورته المتوقعة، زاد ترشيحه للجولة القادمة
+        overdue_pressure = 1.0 + min(0.85, (gap / expected_gap) * 0.45)
 
-        # 2. منع نسخ العنصر الأخير إلا إذا كان السيرفر في موجة تكرار، وإعطاء أولوية للعناصر البديلة للجولة القادمة
-        if item == last_item:
-            repeat_penalty = 0.42  # خفض العنصر الذي ظهر للتو لكي نرشح النقلة الجديدة للجولة القادمة
-        elif n >= 2 and item == clean_hist[-2]:
-            repeat_penalty = 0.75
+        # وزن الانتقال الشرطي (Transition Probability)
+        if total_after_last > 0 and next_after_last[item] > 0:
+            trans_boost = 1.0 + ((next_after_last[item] / total_after_last) * 0.75)
         else:
-            repeat_penalty = 1.15
+            trans_boost = 1.0
 
-        # 3. ديناميكية فئات المضاعفات للجولة القادمة
-        tier_boost = 1.0
-        if last_meta["mult"] >= 25:
-            # بعد ضربة كبيرة (×25 أو ×45 أو نادر)، العجلة في هاي فامي تهدأ وترجع للخضروات ×5 أو ×10
-            if meta["tier"] == "veg":
-                tier_boost = 1.45
-            elif meta["mult"] >= 25:
-                tier_boost = 0.35
-        elif consecutive_veg >= 3:
-            # بعد 3 أو 4 جولات خضروات متتالية، العجلة تستعد لرمي مضاعف متوسط أو عالٍ (×10، ×15، ×25، أو نادر)
-            if meta["mult"] in [10, 15, 25]:
-                tier_boost = 1.65
-            elif meta["tier"] in ["meat_max", "jackpot"]:
-                tier_boost = 1.50
+        # معالجة العنصر الذي ظهر في الجولة الأخيرة للتو:
+        # لا نريده أن يتصدر دائماً إلا إذا كان السيرفر في موجة تكرار واضحة
+        if item == last_item:
+            if repeat_rate > 0.35:
+                immediate_factor = 0.95  # السيرفر يكرر، نبقيه ضمن المرشحين
+            else:
+                immediate_factor = 0.42  # السيرفر يغير، نخفض العنصر الأخير لنفسح مجالاً للجولة القادمة الحقيقية
+        else:
+            immediate_factor = 1.15
 
-        # 4. تعزيز الانتقال التاريخي المرصود
-        trans_boost = 1.0 + (transitions.get(item, 0) * 0.35)
+        # إذا استهلك العنصر أكثر من حصته الطبيعية مؤخراً، نخفض وزنه للجولة القادمة (تصحيح التوازن)
+        obs_ratio = (counts.get(item, 0) / n)
+        saturation_penalty = 0.70 if obs_ratio > (base_w * 1.8) else 1.0
 
-        scores[item] = base_w * overdue_boost * repeat_penalty * tier_boost * trans_boost
+        scores[item] = base_w * overdue_pressure * trans_boost * immediate_factor * saturation_penalty
 
-    # تطبيع الدرجات إلى نسب مئوية
-    total_s = sum(scores.values()) or 1.0
-    norm_probs = {k: (v / total_s) * 100.0 for k, v in scores.items()}
+    # ضمان تشكيلة ذكية للخمس خانات: (أفضل 3 من فئة الخضروات ×5 + أفضل 2 من فئة المضاعفات العالية/النادرة)
+    common_items = [k for k in all_items if FARM_ITEMS_META[k]["tier"] == "common"]
+    special_items = [k for k in all_items if FARM_ITEMS_META[k]["tier"] != "common"]
 
-    # لضمان تشكيلة ذكية لرمي الكوينزات (3 خضروات/أمان + 2 صيدات مضاعفات عالية عليها الدور)
-    veg_candidates = sorted([k for k in ALL_FARM_KEYS if "×5" in k], key=lambda x: norm_probs[x], reverse=True)
-    high_candidates = sorted([k for k in ALL_FARM_KEYS if "×5" not in k], key=lambda x: norm_probs[x], reverse=True)
+    total_score = sum(scores.values()) or 1.0
+    norm_probs = {k: (v / total_score) * 100.0 for k, v in scores.items()}
 
-    if consecutive_veg >= 4:
-        # إذا طالت سلسلة الخضروات، نرشح 2 خضروات للتأمين + 3 مضاعفات/نوادر لاقتناص الضربة
-        selected_5 = veg_candidates[:2] + high_candidates[:3]
-        strategy_tag = "🔥 وضع اقتناص المضاعفات (بعد سلسلة خضروات)"
-    else:
-        # التوزيعة القياسية الرابحة في المزرعة: أقوى 3 خضروات عليها الدور + أقوى 2 مضاعفات/نوادر
-        selected_5 = veg_candidates[:3] + high_candidates[:2]
-        strategy_tag = "🎯 توزيعة الجوله القادمة (3 تأمين ×5 + 2 مضاعف عالٍ)"
+    top_commons = sorted(common_items, key=lambda k: norm_probs[k], reverse=True)[:3]
+    top_specials = sorted(special_items, key=lambda k: norm_probs[k], reverse=True)[:2]
 
-    selected_5 = sorted(selected_5, key=lambda x: norm_probs[x], reverse=True)
+    combined_selection = top_commons + top_specials
+    final_top5 = sorted(combined_selection, key=lambda k: norm_probs[k], reverse=True)
 
-    emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    rank_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     lines = []
-    coverage_sum = 0.0
-    for idx, item_key in enumerate(selected_5):
-        p_val = norm_probs[item_key]
-        coverage_sum += p_val
-        role = "تأمين أساسي" if "×5" in item_key else ("صيدة نادرة 🌟" if "نادر" in item_key else "صيدة مضاعف 🎯")
-        lines.append(f"{emojis[idx]} {item_key} — <strong>{p_val:.1f}%</strong> <span style='font-size:9px;color:#cbd5e1;'>[{role}]</span>")
+    top5_sum = 0.0
+    for idx, item_name in enumerate(final_top5):
+        p = norm_probs[item_name]
+        top5_sum += p
+        role_tag = "تغطية أساسية" if FARM_ITEMS_META[item_name]["tier"] == "common" else "صيد مضاعف"
+        lines.append(f"{rank_emojis[idx]} {item_name} — ترشيح القادم {p:.1f}% ({role_tag})")
 
-    lines.append(f"<span style='font-size:9px;color:#34d399;'>⚡ الاستراتيجية: {strategy_tag}</span>")
-    conf_str = f"{min(96.5, coverage_sum + 18.0):.1f}% (توقع الجولة القادمة)"
-    log_note = f"[FARM-NEXT] Last={last_item.split()[1]} | VegStreak={consecutive_veg} | NextTop1={selected_5[0].split()[1]}"
+    lines.append(f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>")
+    conf_str = f"{min(96.5, top5_sum + 12.0):.1f}% (توقع القادم)"
+    log_note = f"[FARM-NEXT-PRED] Sample={n} | Last={last_item[:6]} | RepeatRate={repeat_rate:.2f}"
     return "<br>".join(lines), conf_str, log_note
 
-def predict_next_poker_round(clean_hist: List[str]) -> Tuple[str, str, str]:
+def predict_next_poker_round(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
     """
-    محرك استنتاج الجولة القادمة للبوكر (Next-Round Seat Predictor):
-    يحلل نمط انتقال الكراسي (هل السيرفر يدور الكراسي A->B->C أم يقفز أم يثبت؟)
-    ويخرج الكرسي المتوقع للجولة القادمة + الكرسي البديل للتغطية.
+    يتوقع الكرسي القادم في البوكر (توقع مؤكد + توقع بديل) بناءً على:
+    - ماذا يأتي بعد الكرسي الأخير؟
+    - أي كرسي متأخر في الظهور (Overdue Chair)؟
     """
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
     norm_hist = []
@@ -272,60 +244,53 @@ def predict_next_poker_round(clean_hist: List[str]) -> Tuple[str, str, str]:
             norm_hist.append("🔴 كرسي C")
 
     n = len(norm_hist)
-    now_sec = int(datetime.now(timezone.utc).timestamp())
-
     if n == 0:
-        idx1 = (now_sec // 20) % 3
-        idx2 = (idx1 + 1) % 3
         return (
-            f"⭐ التوقع المؤكد للجولة القادمة: {chairs[idx1]} (38.5%)<br>"
-            f"🔄 التوقع البديل (تغطية): {chairs[idx2]} (32.0%)<br>"
-            f"<span style='font-size:9px;color:#fcd34d;'>💡 أدخل آخر الكراسي الفائزة لكشف اتجاه دوران الطاولة!</span>",
-            "70.5% (تغطية مقعدين)",
-            "[POKER-NEXT] Mode=Opening | Waiting for history"
+            f"⭐ التوقع المؤكد للجولة القادمة: 🟢 كرسي A (34.0%)<br>"
+            f"🔄 التوقع البديل (تغطية): 🔵 كرسي B (33.0%)<br>"
+            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
+            "67.0% (توقع مقعدين)",
+            "[POKER-NEXT] Sample=0 | Ready"
         )
 
     last_chair = norm_hist[-1]
     counts = Counter(norm_hist)
 
-    # تحليل نمط الحركة في آخر الجولات
-    # هل السيرفر يغير الكرسي في كل جولة (Shift) أم يكرر نفس الكرسي (Repeat)؟
-    repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
-    shifts = (n - 1) - repeats
-
-    # حساب الانتقالات المباشرة بعد الكرسي الأخير
-    next_after_last = Counter()
+    # حساب الانتقالات بعد الكرسي الأخير
+    trans_counts = Counter()
+    trans_total = 0
     for i in range(n - 1):
         if norm_hist[i] == last_chair:
-            next_after_last[norm_hist[i + 1]] += 1
+            trans_counts[norm_hist[i + 1]] += 1
+            trans_total += 1
 
-    scores: Dict[str, float] = {}
+    # حساب معدل التكرار مقابل التغيير في الطاولة الحالية
+    repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
+    repeat_ratio = repeats / (n - 1) if n > 1 else 0.33
+
+    scores = {}
     for c in chairs:
-        # الفجوة منذ آخر فوز لهذا الكرسي
+        # فجوة الغياب للكرسي
         if c in norm_hist:
             gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
         else:
-            gap = n + 1
+            gap = n + 2
 
-        gap_score = 1.0 + (gap * 0.28)
-        trans_score = 1.0 + (next_after_last.get(c, 0) * 0.45)
+        overdue_boost = 1.0 + min(0.65, gap * 0.22)
+        trans_prob = ((trans_counts[c] + 1.0) / (trans_total + 3.0)) if trans_total > 0 else (1.0 / 3.0)
 
+        # إذا كان الكرسي هو نفس الكرسي الأخير، نتحقق مما إذا كانت الطاولة تكرر أم تعكس
         if c == last_chair:
-            # إذا كان السيرفر في وضع تغيير مستمر (Shifts > Repeats)، نخفض احتمال تكرار نفس الكرسي في الجولة القادمة
-            if shifts >= repeats:
-                pattern_mod = 0.55
-            else:
-                pattern_mod = 1.25
+            chair_Flow = 1.15 if repeat_ratio >= 0.45 else 0.65
         else:
-            # إذا كان هناك كرسي غائب منذ 3 جولات أو أكثر، يرتفع وزنه بقوة للجولة القادمة
-            pattern_mod = 1.35 if gap >= 2 else 1.10
+            chair_Flow = 1.20 if repeat_ratio < 0.45 else 0.90
 
-        # منع فخ Ping-Pong (مثلاً A -> B -> A -> ؟)
-        if n >= 3 and norm_hist[-3] == norm_hist[-1] and norm_hist[-2] != norm_hist[-1]:
-            if c == norm_hist[-2]:
-                pattern_mod *= 1.30
+        # توازن الحصص (الكراسي الأقل ظهوراً في آخر 10 جولات لها فرصة ارتداد أعلى)
+        recent_slice = norm_hist[-9:]
+        recent_freq = recent_slice.count(c) / len(recent_slice)
+        balance_factor = 1.25 if recent_freq < 0.25 else (0.80 if recent_freq > 0.50 else 1.0)
 
-        scores[c] = gap_score * trans_score * pattern_mod
+        scores[c] = trans_prob * overdue_boost * chair_Flow * balance_factor
 
     total_s = sum(scores.values()) or 1.0
     probs = {c: (scores[c] / total_s) * 100.0 for c in chairs}
@@ -333,23 +298,19 @@ def predict_next_poker_round(clean_hist: List[str]) -> Tuple[str, str, str]:
 
     main_chair, main_p = ranked[0]
     alt_chair, alt_p = ranked[1]
-    combined = main_p + alt_p
+    comb_p = main_p + alt_p
 
-    mode_desc = "دوران نشط بين الكراسي" if shifts >= repeats else "ميل لتثبيت الكرسي"
     pred_html = (
-        f"⭐ التوقع المؤكد للجولة القادمة: <strong>{main_chair}</strong> ({main_p:.1f}%)<br>"
-        f"🔄 التوقع البديل (تأمين الطاولة): <strong>{alt_chair}</strong> ({alt_p:.1f}%)<br>"
-        f"<span style='font-size:9px;color:#34d399;'>[سلوك الطاولة: {mode_desc} | تغطية الفوز: {combined:.1f}%]</span>"
+        f"⭐ التوقع المؤكد للجولة القادمة: {main_chair} ({main_p:.1f}%)<br>"
+        f"🔄 التوقع البديل (تغطية آمنة): {alt_chair} ({alt_p:.1f}%)<br>"
+        f"<span style='font-size:9px;color:#93c5fd;'>[قوة التغطية للجولة القادمة: {comb_p:.1f}% | بناءً على {n} جولات]</span><br>"
+        f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
     )
-    conf_str = f"{combined:.1f}% (مؤكد + بديل)"
-    log_note = f"[POKER-NEXT] Last={last_chair[-1]} -> NextMain={main_chair[-1]} ({main_p:.1f}%) | Alt={alt_chair[-1]}"
-    return pred_html, conf_str, log_note
+    return pred_html, f"{comb_p:.1f}% (مؤكد + بديل)", f"[POKER-NEXT] Last={last_chair} -> Main={main_chair}"
 
-def predict_next_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
+def predict_next_dragon_tiger(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
     """
-    محرك استنتاج الجولة القادمة لدراجون تايجر (Next-Round Sequence Predictor):
-    يحلل طول السلسلة الحالية (Streak Length) ومقارنتها بأقصى سلسلة في الغرفة لتحديد:
-    هل نلعب مع الموجة أم نلعب كسر السلسلة (Break) في الجولة القادمة؟
+    يتوقع الجولة القادمة في Dragon & Tiger عبر كشف نمط الطاولة (سلسلة Streak أو تبادل Chop أو نمط 2-1).
     """
     norm_hist = []
     for h in clean_hist:
@@ -361,85 +322,65 @@ def predict_next_dragon_tiger(clean_hist: List[str]) -> Tuple[str, str, str]:
             norm_hist.append("🤝 تعادل")
 
     n = len(norm_hist)
-    now_sec = int(datetime.now(timezone.utc).timestamp())
-
     if n == 0:
-        pick = "🐉 تنين (Dragon)" if (now_sec // 15) % 2 == 0 else "🐅 تايجر (Tiger)"
         return (
-            f"⚡ توقع الجولة القادمة: <strong>{pick}</strong> (51.5%)<br>"
-            f"<span style='font-size:9px;color:#fcd34d;'>💡 سجل آخر النتائج الظاهرة لكشف نمط الغرفة (تتابع أو عكس)!</span>",
-            "51.5% (افتتاحي)",
-            "[DT-NEXT] Mode=Opening | Waiting for sequence"
+            f"🐉 التوقع القادم: تنين (Dragon) — 50.0%<br>"
+            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
+            "50.0% (افتتاحي)",
+            "[DT-NEXT] Sample=0"
         )
 
     non_tie = [x for x in norm_hist if x != "🤝 تعادل"]
-    tie_count = norm_hist.count("🤝 تعادل")
-
     if not non_tie:
         return (
-            "⚡ توقع الجولة القادمة: <strong>🐉 تنين (Dragon)</strong> (52.0%)<br>"
-            "<span style='font-size:9px;color:#34d399;'>[بعد التعادل يميل السيرفر لفتح موجة جديدة]</span>",
-            "52.0% (بعد تعادل)",
-            "[DT-NEXT] Post-Tie reset"
+            f"🐅 التوقع القادم: تايجر (Tiger) — 51.5%<br>"
+            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
+            "51.5%",
+            "[DT-NEXT] Only ties recorded"
         )
 
-    last_side = non_tie[-1]
-    opposite_side = "🐅 تايجر" if last_side == "🐉 تنين" else "🐉 تنين"
+    last_item = non_tie[-1]
+    opposite = "🐅 تايجر" if last_item == "🐉 تنين" else "🐉 تنين"
 
-    # حساب طول السلسلة الحالية
-    current_streak = 0
-    for x in reversed(non_tie):
-        if x == last_side:
+    # حساب طول السلسلة الحالية (Current Streak)
+    current_streak = 1
+    for i in range(len(non_tie) - 2, -1, -1):
+        if non_tie[i] == last_item:
             current_streak += 1
         else:
             break
 
-    # حساب انتقالات التبديل مقابل الاستمرار
+    # حساب عدد مرات التبديل مقابل التكرار
     switches = sum(1 for i in range(1, len(non_tie)) if non_tie[i] != non_tie[i - 1])
-    repeats = (len(non_tie) - 1) - switches
+    repeats = sum(1 for i in range(1, len(non_tie)) if non_tie[i] == non_tie[i - 1])
 
-    # منطق استنتاج الجولة القادمة:
-    if current_streak >= 3 and switches >= repeats:
-        # الغرفة بطبيعتها تكسر السلاسل، والسلسلة وصلت 3 -> الجولة القادمة كسر (انعكاس)
-        next_pick = opposite_side
-        tactic = f"نقطة كسر السلسلة (بعد تكرار {current_streak} مرات)"
-        prob = min(74.5, 58.0 + current_streak * 3.5)
-    elif current_streak == 2 and repeats > switches:
-        # الغرفة تميل للسلاسل الطويلة -> ركوب الموجة للجولة القادمة
-        next_pick = last_side
-        tactic = "ركوب موجة التتابع (Streak Follow)"
-        prob = min(72.0, 56.0 + (repeats - switches) * 3.0)
-    elif len(non_tie) >= 3 and non_tie[-1] != non_tie[-2] and non_tie[-2] != non_tie[-3]:
-        # نمط رايح جاي (Ping-Pong: تنين -> تايجر -> تنين -> ؟) -> الجولة القادمة عكس الأخير
-        next_pick = opposite_side
-        tactic = "نمط تبادلي صريح (Ping-Pong 1-1)"
-        prob = 69.5
+    # تحديد توقع الجولة القادمة بذكاء
+    if current_streak >= 3 and repeats >= switches:
+        # الطاولة في خط متسلسل طويل (Dragon/Tiger Run) -> اتبع السلسلة حتى تنكسر
+        next_pred = last_item
+        reason = f"تتبع السلسلة النشطة ({current_streak} مرات متتالية)"
+    elif current_streak == 2 and switches > repeats:
+        # الطاولة تميل للانعكاس السريع بعد مرتين
+        next_pred = opposite
+        reason = "نقطة انعكاس متوقعة بعد جولتين"
+    elif switches > repeats:
+        # نمط تبادلي (واحدة بواحدة - Ping Pong) -> اعكس النتيجة الأخيرة فوراً
+        next_pred = opposite
+        reason = "نمط تبادلي نشط (عكس الجولة السابقة)"
     else:
-        # إذا ظهر عنصر مرة واحدة فقط، نفحص أيهما أقل ظهوراً لإعادة التوازن أو عكس الأخير
-        next_pick = opposite_side if current_streak >= 2 else (opposite_side if switches >= repeats else last_side)
-        tactic = "استنتاج التوازن للجولة القادمة"
-        prob = 61.5
+        # مقارنة التوازن العام
+        d_c = non_tie.count("🐉 تنين")
+        t_c = non_tie.count("🐅 تايجر")
+        next_pred = "🐅 تايجر" if d_c > t_c else "🐉 تنين"
+        reason = "تصحيح التوازن الإحصائي للطاولة"
 
-    # فحص ما إذا كان التعادل غائباً منذ فترة طويلة (للتنبيه الإضافي فقط)
-    tie_alert = " | 🎯 احتمال تعادل ثانوي (×8) وارد" if (n >= 8 and tie_count == 0) else ""
-
+    est_prob = min(74.5, 53.0 + (abs(switches - repeats) * 2.2) + (current_streak * 1.5))
     pred_html = (
-        f"⚡ التوقع الأقوى للجولة القادمة: <strong>{next_pick}</strong> ({prob:.1f}%)<br>"
-        f"<span style='font-size:9px;color:#34d399;'>[التكتيك: {tactic}{tie_alert}]</span>"
+        f"⚡ التوقع المؤكد للجولة القادمة: {next_pred} ({est_prob:.1f}%)<br>"
+        f"<span style='font-size:9px;color:#93c5fd;'>[السبب: {reason}]</span><br>"
+        f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
     )
-    conf_str = f"{prob:.1f}% (توقع الجولة القادمة)"
-    log_note = f"[DT-NEXT] Last={last_side.split()[1]}(x{current_streak}) -> Next={next_pick.split()[1]} ({prob:.1f}%)"
-    return pred_html, conf_str, log_note
-
-@app.get("/api/server-status")
-def server_status():
-    """نقطة فحص حية لحالة السيرفر ودورة الـ 7 ساعات وجودة الوقت في هاي فامي"""
-    status_info = check_server_cycle_and_time(0)
-    return {
-        "status": "ok",
-        "server_cycle": status_info,
-        "cairo_time": get_cairo_time().strftime("%H:%M:%S")
-    }
+    return pred_html, f"{est_prob:.1f}% (توقع القادم)", f"[DT-NEXT] Streak={current_streak} | Next={next_pred}"
 
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
@@ -447,52 +388,40 @@ def predict(req: PredictionRequest):
         game = req.game_type.upper().strip()
         clean_hist = [clean_history_item(h) for h in req.history if h and h.strip()]
 
-        # 1. فحص دورة راحة السيرفر (كل 7 ساعات) وجودة وقت اللعب في هاي فامي
-        cycle_info = check_server_cycle_and_time(len(clean_hist))
-        if cycle_info["is_resting"]:
-            return {
-                "is_rigged": True,
-                "confidence": "⏸️ وضع الراحة/الحماية",
-                "prediction": f"<span style='color:#fca5a5;'>{cycle_info['reason']}</span>",
-                "safe_bet": 0,
-                "server_badge": cycle_info["badge"],
-                "time_advice": cycle_info["reason"],
-                "engine_log": f"[SERVER-REST] {cycle_info['quality']} active. Betting paused.",
-                "sample_size": len(clean_hist)
-            }
+        # 1. فحص دورة السيرفر (الـ 7 ساعات + أوقات اللعب والـ PK)
+        cycle_meta = check_server_cycle_and_time(req.client_hour, req.client_minute, len(clean_hist))
 
-        # 2. فحص الجحفلة والتكرار الشاذ (5 مرات)
-        is_trap, trap_msg = check_pattern_trap(clean_hist)
+        # 2. فحص تحذير التكرار 5 مرات
+        is_streak_warn, streak_msg = check_streak_warning(clean_hist)
 
-        # 3. تشغيل محرك استنتاج الجولة القادمة حسب اللعبة
+        # 3. توليد توقع الجولة القادمة حسب اللعبة
         if "FARM" in game:
-            pred_html, conf_str, log_note = predict_next_farm_round(clean_hist, cycle_info["quality"])
+            pred_html, conf_str, log_note = predict_next_farm_round(clean_hist, cycle_meta)
         elif "POKER" in game:
-            pred_html, conf_str, log_note = predict_next_poker_round(clean_hist)
+            pred_html, conf_str, log_note = predict_next_poker_round(clean_hist, cycle_meta)
         elif "DRAGON" in game:
-            pred_html, conf_str, log_note = predict_next_dragon_tiger(clean_hist)
+            pred_html, conf_str, log_note = predict_next_dragon_tiger(clean_hist, cycle_meta)
         else:
             pred_html, conf_str, log_note = "يرجى اختيار لعبة صالحة.", "--%", "[ERROR] Unknown game"
 
-        # إضافة شريط حالة توقيت هاي فامي أعلى التوقع
-        time_banner = f"<div style='font-size:9px;color:#fde047;margin-bottom:3px;'>🕒 {cycle_info['reason']}</div>"
-        pred_html = time_banner + pred_html
+        # إذا كان السيرفر في وقت راحة/تبريد أو هناك تكرار 5 مرات، نبرز التنبيه بوضوح
+        is_danger_mode = cycle_meta["is_resting"] or is_streak_warn
+        if is_streak_warn:
+            pred_html = f"<span style='color:#fca5a5;'>{streak_msg}</span><br><hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
 
-        if is_trap:
-            pred_html = f"<span style='color:#fca5a5;'>{trap_msg}</span><br><hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
-            safe_amount = int(req.coins * 0.02) if req.coins > 0 else 0
+        base_bet = int(req.coins * 0.08 * cycle_meta["risk_mult"]) if req.coins > 0 else int(500 * cycle_meta["risk_mult"])
+        if cycle_meta["is_resting"]:
+            safe_amount = 0  # في وقت راحة السيرفر أو الوقت السيئ ينصح بعدم الرهان (0 كوينز)
         else:
-            # تحديد الرهان الآمن حسب جودة وقت اللعب (في وقت الذروة 10%، في الوقت العادي 7%، في بداية الساعة 4%)
-            ratio = 0.10 if cycle_info["quality"] == "GOLDEN" else (0.04 if cycle_info["quality"] == "CAUTION" else 0.07)
-            safe_amount = int(req.coins * ratio) if req.coins > 0 else 500
+            safe_amount = base_bet
 
         return {
-            "is_rigged": is_trap or (cycle_info["quality"] == "CAUTION"),
+            "is_rigged": is_danger_mode,
+            "server_mood": cycle_meta["mood_badge"],
+            "banner_text": cycle_meta["banner"],
             "confidence": conf_str,
             "prediction": pred_html,
             "safe_bet": safe_amount,
-            "server_badge": cycle_info["badge"],
-            "time_advice": cycle_info["reason"],
             "engine_log": log_note,
             "sample_size": len(clean_hist)
         }
@@ -500,20 +429,22 @@ def predict(req: PredictionRequest):
     except Exception as e:
         return {
             "is_rigged": False,
-            "confidence": "خطأ معالجة",
-            "prediction": f"⚠️ تعذر الحساب: {str(e)}",
+            "server_mood": "🟡 تنبيه معالجة",
+            "banner_text": "جاري إعادة المزامنة...",
+            "confidence": "--%",
+            "prediction": f"⚠️ حدث خطأ أثناء الحساب: {str(e)}",
             "safe_bet": 0,
-            "server_badge": "⚠️ خطأ داخلي",
-            "engine_log": "[ERROR] Exception in prediction endpoint",
+            "engine_log": "[ERROR] Exception in endpoint",
             "sample_size": 0
         }
 
 @app.get("/")
 def root():
-    cycle_info = check_server_cycle_and_time(0)
+    elapsed_h = (time.time() - SERVER_START_TIME) / 3600.0
     return {
-        "status": "Phantom Next-Round Predictor v118.0 Active",
-        "server_state": cycle_info["badge"],
+        "status": "Phantom Next-Round Predictor v119.0 Active",
+        "uptime_hours": round(elapsed_h, 2),
+        "cycle_rule": "Active 7h / Auto-Rest 30m + PK Time Shield",
         "developer": "MR"
     }
 
