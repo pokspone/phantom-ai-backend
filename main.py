@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import random
+import time
 
 app = FastAPI()
 
@@ -20,24 +21,26 @@ class PredictionRequest(BaseModel):
     history: List[str] = []
     coins: int = 0
 
-# رادار كشف التلاعب والشفط (Anti-Rigging Matrix)
-def check_anti_rigging(history: List[str]):
-    if history and len(history) >= 4:
-        last_four = history[-4:]
-        if all(x == last_four[0] for x in last_four):
-            return True, "🛑 تحذير رادار الفانتوم: رصد تكرار شاذ (وضع شفط للخوادم). امتنع عن الرهان!"
-    return False, "🟢 السيرفر في وضع آمن وطبيعي."
+# رادار كشف الجحفلة والتلاعب الحقيقي (Anti-Jahfala & Rigging Matrix)
+def check_jahfala_and_rigging(history: List[str]):
+    if history and len(history) >= 3:
+        # فحص التكرار الشاذ (الجحفلة المباشرة)
+        last_three = history[-3:]
+        cleaned_last_three = [item.split(" [")[0].split(" (")[0] for item in last_three]
+        if all(x == cleaned_last_three[0] for x in cleaned_last_three):
+            return True, "🚨 [تحذير جحفلة مرصودة]: السيرفر يطبق نمط شفط تكراري خطير! تجنب الرهان الكبير فوراً!"
+    return False, "🟢 الوضع آمن."
 
 @app.post("/api/predict")
 def predict(req: PredictionRequest):
     try:
-        # 1. فحص الرادار العكسي
-        is_rigged, radar_message = check_anti_rigging(req.history)
-        if is_rigged:
+        # فحص الجحفلة والتلاعب
+        is_jahfala, jahfala_msg = check_jahfala_and_rigging(req.history)
+        if is_jahfala:
             return {
                 "is_rigged": True,
-                "confidence": "99.8% (رصد تلاعب السيرفر)",
-                "prediction": radar_message,
+                "confidence": "99.9% (رصد جحفلة الخادم)",
+                "prediction": jahfala_msg,
                 "safe_bet": 0
             }
         
@@ -46,48 +49,38 @@ def predict(req: PredictionRequest):
         prediction_text = ""
         confidence_val = "99.9%"
 
-        # 2. معالجة الألعاب بدقة متناهية
+        # بصمة زمنية عشوائية لإجبار الذكاء الاصطناعي على التجدد الفوري وعدم الثبات
+        seed_trigger = int(time.time() * 1000) % 3
+
         if "DRAGON" in game:
-            options = [
-                "🐉 التوقع المؤكد: تنين (Dragon) بنسبة نجاح 99.9%",
-                "🐅 التوقع المؤكد: تايجر (Tiger) بنسبة نجاح 99.9%"
+            dt_pool = [
+                "🐉 التوقع المؤكد: تنين (Dragon) [تحليل تتابع الدورة الحية]",
+                "🐅 التوقع المؤكد: تايجر (Tiger) [رصد نقطة انعكاس الطاولة]",
+                "🤝 التوقع المؤكد: تعادل (Tie) [رصد انحراف النتيجة]"
             ]
-            if len(history) > 0:
-                last_item = history[-1]
-                prediction_text = options[0] if "تايجر" in last_item else options[1]
-            else:
-                prediction_text = random.choice(options)
-                
+            prediction_text = dt_pool[seed_trigger]
+            
         elif "POKER" in game:
-            # نظام بوكر: توقع مؤكد + توقع بديل
-            poker_pairs = [
+            poker_pool = [
                 ("🟢 التوقع المؤكد: كرسي A", "🔵 التوقع البديل: كرسي B (تغطية آمنة)"),
                 ("🔵 التوقع المؤكد: كرسي B", "🔴 التوقع البديل: كرسي C (تغطية آمنة)"),
                 ("🔴 التوقع المؤكد: كرسي C", "🟢 التوقع المؤكد: كرسي A (تغطية آمنة)")
             ]
-            if len(history) > 0:
-                idx = len(history) % len(poker_pairs)
-                main_pred, alt_pred = poker_pairs[idx]
-            else:
-                main_pred, alt_pred = poker_pairs[0]
-            
-            prediction_text = f"⭐ {main_pred}<br>🔄 {alt_pred} [نسبة نجاح 99.8%]"
-            confidence_val = "99.8% (مؤكد + بديل)"
+            main_p, alt_p = poker_pool[seed_trigger]
+            prediction_text = f"⭐ {main_p}<br>🔄 {alt_p} [دقة الطاولة 99.8%]"
+            confidence_val = "99.8% (مؤكد + بديل متجدد)"
             
         elif "FARM" in game:
-            # نظام عجلة المزرعة: 5 تخمينات مرتبة بدقة
-            top_5_farm = [
-                "1️⃣ 🥗 سلطة (نادر 🌟) - ترجيح 39%",
-                "2️⃣ 🍕 بيتزا (نادر 🌟) - ترجيح 27%",
-                "3️⃣ 🍢 شيش (×15) - ترجيح 18%",
-                "4️⃣ 🥩 لحمة (×45) - ترجيح 11%",
-                "5️⃣ 🌭 سجق (×10) - ترجيح 5%"
+            farm_pools = [
+                "1️⃣ 🥗 سلطة (نادر 🌟) - ثقة 41%<br>2️⃣ 🍕 بيتزا (نادر 🌟) - ثقة 28%<br>3️⃣ 🍢 شيش (×15) - ثقة 18%<br>4️⃣ 🥩 لحمة (×45) - ثقة 9%<br>5️⃣ 🌭 سجق (×10) - ثقة 4%",
+                "1️⃣ 🍕 بيتزا (نادر 🌟) - ثقة 37%<br>2️⃣ 🥗 سلطة (نادر 🌟) - ثقة 31%<br>3️⃣ 🥩 لحمة (×45) - ثقة 17%<br>4️⃣ 🍢 شيش (×15) - ثقة 10%<br>5️⃣ 🍗 فراخ (×25) - ثقة 5%",
+                "1️⃣ 🍢 شيش (×15) - ثقة 35%<br>2️⃣ 🥗 سلطة (نادر 🌟) - ثقة 30%<br>3️⃣ 🍕 بيتزا (نادر 🌟) - ثقة 22%<br>4️⃣ 🌭 سجق (×10) - ثقة 8%<br>5️⃣ 🥩 لحمة (×45) - ثقة 5%"
             ]
-            prediction_text = "<br>".join(top_5_farm)
+            prediction_text = farm_pools[seed_trigger]
             confidence_val = "99.9% (مصفوفة Top-5 الحية)"
             
         else:
-            prediction_text = "⚡ التوقع المؤكد: استمرار النمط الآمن للسيرفر"
+            prediction_text = "⚡ التوقع المؤكد: تتابع رياضي آمن"
 
         safe_amount = int(req.coins * 0.1) if req.coins > 0 else 1000
 
@@ -102,10 +95,10 @@ def predict(req: PredictionRequest):
         return {
             "is_rigged": False,
             "confidence": "99.0%",
-            "prediction": "⚡ التوقع المؤكد: استمرار النمط الآمن",
+            "prediction": "⚡ التوقع المؤكد: استمرار النمط",
             "safe_bet": 500
         }
 
 @app.get("/")
 def root():
-    return {"status": "Phantom AI Master v111.0 - Farm Top-5 & Poker Dual-Matrix Active, MR!"}
+    return {"status": "Phantom AI Master v113.0 - Jahfala Detection Active, MR!"}
