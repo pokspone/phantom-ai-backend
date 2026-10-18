@@ -5,11 +5,14 @@ import logging
 import math
 import os
 import time
-from collections import Counter, defaultdict
-from datetime import datetime, timezone, timedelta
+import urllib.parse
+import urllib.request
+import urllib.error
+from collections import Counter
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -21,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.0")
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,10 +35,13 @@ app.add_middleware(
 )
 
 STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.json")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uimxwispsiqalizeppqw.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_OxyjnNeEhj3G1MpmgnznIg_I1Hm69p1")
+ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "JAKYMR77")
 
 
 # =====================================================================
-# 1. نماذج البيانات والإعدادات القابلة للتعديل
+# 1. نماذج البيانات والإعدادات ومصادقة الأدمن
 # =====================================================================
 
 class RuntimeConfig(BaseModel):
@@ -46,6 +52,15 @@ class RuntimeConfig(BaseModel):
     high_load_threshold_rpm: int = Field(default=45, ge=5, le=1000)
     min_sample_for_pattern: int = Field(default=6, ge=3, le=50)
     dedup_window_seconds: int = Field(default=2, ge=0, le=30)
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+class LicenseVerifyRequest(BaseModel):
+    key_code: str
+    device_token: str
 
 
 class PredictionRequest(BaseModel):
@@ -59,7 +74,44 @@ class PredictionRequest(BaseModel):
 
 
 # =====================================================================
-# 2. مدير التشغيل والموارد ودورة الـ 7 ساعات (Lifecycle & Load Manager)
+# 2. مساعد اتصال قاعدة البيانات الخلفي (Supabase Proxy Helper)
+# =====================================================================
+
+def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict] = None) -> Tuple[int, any]:
+    """
+    اتصال خلفي بقاعدة بيانات Supabase باستخدام المفتاح المعتمد بدون كسر الترويسة
+    ليعمل كجسر احتياطي إذا واجه المتصفح مشكلة CORS أو شبكة.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    # إذا كان المفتاح بصيغة JWT تقليدية نضيف Authorization، أما sb_publishable فيعتمد على apikey
+    if SUPABASE_KEY.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if method in ("POST", "PATCH"):
+        headers["Prefer"] = "return=representation"
+
+    data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else []
+            return resp.status, parsed
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        logger.error(f"Supabase HTTP {e.code}: {err_body}")
+        return e.code, {"error": err_body}
+    except Exception as e:
+        logger.error(f"Supabase connection error: {e}")
+        return 503, {"error": str(e)}
+
+
+# =====================================================================
+# 3. مدير التشغيل والموارد ودورة الـ 7 ساعات (Lifecycle & Load Manager)
 # =====================================================================
 
 class ServerLifecycleManager:
@@ -69,7 +121,7 @@ class ServerLifecycleManager:
         self.start_time = time.time()
         self.last_checkpoint_time = time.time()
         self.last_request_time = time.time()
-        self.operational_mode = "ACTIVE"  # ACTIVE | LOW_POWER_REST | HIGH_LOAD_THROTTLED | MAINTENANCE_CHECKPOINT
+        self.operational_mode = "ACTIVE"
         self.total_requests = 0
         self.error_count = 0
         self.checkpoints_completed = 0
@@ -81,7 +133,6 @@ class ServerLifecycleManager:
         self.load_persisted_state()
 
     def load_persisted_state(self):
-        """استرجاع حالة العمل والبيانات المحفوظة عند بدء التشغيل لمنع فقدان السجل"""
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r", encoding="utf-8") as f:
@@ -98,7 +149,6 @@ class ServerLifecycleManager:
                 logger.error(f"Failed to load state file: {exc}")
 
     def save_persisted_state(self):
-        """حفظ حالة العمل والبيانات قبل أي نقطة مراجعة أو راحة"""
         try:
             payload = {
                 "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -130,11 +180,9 @@ class ServerLifecycleManager:
         hours_since_checkpoint = (now - self.last_checkpoint_time) / 3600.0
         idle_seconds = now - self.last_request_time
 
-        # 1. فحص نقطة المراجعة الدورية (كل 7 ساعات افتراضياً) دون إعادة تشغيل قسرية
         if hours_since_checkpoint >= self.config.review_cycle_hours:
             self.operational_mode = "MAINTENANCE_CHECKPOINT"
             self.save_persisted_state()
-            # تنظيف الذاكرة المؤقتة القديمة مع الحفاظ على سجلات الغرف
             self.dedup_cache = {
                 k: v for k, v in self.dedup_cache.items() if now - v[0] <= self.config.dedup_window_seconds
             }
@@ -142,7 +190,6 @@ class ServerLifecycleManager:
             self.checkpoints_completed += 1
             logger.info(f"7-Hour Checkpoint #{self.checkpoints_completed} completed without data loss.")
 
-        # 2. الاستئناف التلقائي فور وصول طلب جديد إذا كان في وضع الراحة
         if is_incoming_prediction:
             self.last_request_time = now
             self.recent_request_timestamps.append(now)
@@ -152,7 +199,6 @@ class ServerLifecycleManager:
             else:
                 self.operational_mode = "ACTIVE"
         else:
-            # في حال عدم وجود طلبات لفترة طويلة ينتقل السيرفر تلقائياً لوضع الراحة وتوفير الموارد
             if idle_seconds >= self.config.idle_timeout_seconds:
                 if self.operational_mode != "LOW_POWER_REST":
                     self.operational_mode = "LOW_POWER_REST"
@@ -166,7 +212,7 @@ class ServerLifecycleManager:
             0.0, self.config.review_cycle_hours - ((now - self.last_checkpoint_time) / 3600.0)
         )
 
-        mode_Arabic = {
+        mode_arabic = {
             "ACTIVE": "🟢 السيرفر نشط (تشغيل قياسي)",
             "LOW_POWER_REST": "🟠 وضع توفير الموارد (يستأنف تلقائياً عند الطلب)",
             "HIGH_LOAD_THROTTLED": "🟡 ضغط مرتفع (تنظيم المهام المتزامنة نشط)",
@@ -175,7 +221,7 @@ class ServerLifecycleManager:
 
         return {
             "mode": self.operational_mode,
-            "mode_label": mode_Arabic,
+            "mode_label": mode_arabic,
             "rpm": rpm,
             "active_tasks": self.active_tasks,
             "max_concurrent_tasks": self.config.max_concurrent_tasks,
@@ -191,7 +237,7 @@ lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
 
 
 # =====================================================================
-# 3. المحركات الإحصائية المنفصلة للألعاب الثلاث (بدون تسريب للمستقبل)
+# 4. المحركات الإحصائية المنفصلة للألعاب الثلاث (بدون تسريب للمستقبل)
 # =====================================================================
 
 FARM_CATALOG: Dict[str, Dict] = {
@@ -213,14 +259,7 @@ def normalize_item_name(raw: str) -> str:
 
 
 def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
-    """
-    حساب التوزيع الاحتمالي للجولة التالية لعجلة المزرعة بالاعتماد فقط على السجل المتاح حتى اللحظة t:
-    - يدمج مصفوفة الانتقال الشرطي من الدرجة الأولى والثانية (Markov Order-1 & Order-2).
-    - يدمج ضغط التأخر عن الدورة الطبيعية (Overdue Gap Ratio) لكسر ثبات عناصر ×5.
-    - يطبق عقوبة عدم نسخ آخر نتيجة مباشرة ما لم يكن معدل التكرار في السجل مرتفعاً فعلياً.
-    """
     n = len(history_slice)
-    all_items = list(FARM_CATALOG.keys())
     if n == 0:
         return {k: v["prior_prob"] * 100.0 for k, v in FARM_CATALOG.items()}
 
@@ -228,7 +267,6 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
     last_1 = history_slice[-1]
     last_2 = tuple(history_slice[-2:]) if n >= 2 else None
 
-    # انتقالات الدرجة الأولى: ماذا جاء بعد last_1؟
     trans_1 = Counter()
     total_trans_1 = 0
     for i in range(n - 1):
@@ -236,7 +274,6 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
             trans_1[history_slice[i + 1]] += 1
             total_trans_1 += 1
 
-    # انتقالات الدرجة الثانية: ماذا جاء بعد (history[-2], history[-1])؟
     trans_2 = Counter()
     total_trans_2 = 0
     if last_2 and n >= 3:
@@ -245,24 +282,18 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
                 trans_2[history_slice[i + 2]] += 1
                 total_trans_2 += 1
 
-    # معدل التكرار المتتالي الفعلي في السجل
     consecutive_repeats = sum(1 for i in range(1, n) if history_slice[i] == history_slice[i - 1])
     observed_repeat_rate = (consecutive_repeats / (n - 1)) if n > 1 else 0.15
 
     raw_scores: Dict[str, float] = {}
     for item, meta in FARM_CATALOG.items():
         prior = meta["prior_prob"]
-        obs_freq = counts.get(item, 0) / n
-
-        # 1. تقدير بايزي مرن للتكرار العام
         alpha = 4.0
         empirical_bayes = (counts.get(item, 0) + alpha * prior) / (n + alpha)
 
-        # 2. احتمال الانتقال الشرطي للجولة القادمة
         p_t1 = (trans_1[item] + 1.5 * prior) / (total_trans_1 + 1.5) if total_trans_1 > 0 else empirical_bayes
         p_t2 = (trans_2[item] + 1.0 * prior) / (total_trans_2 + 1.0) if total_trans_2 > 0 else p_t1
 
-        # 3. حساب فجوة الغياب (كم جولة مرت منذ آخر ظهور لهذا العنصر؟)
         if item in history_slice:
             last_pos = len(history_slice) - 1 - history_slice[::-1].index(item)
             gap = (n - 1) - last_pos
@@ -270,15 +301,12 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
             gap = n + 1
 
         overdue_ratio = gap / meta["expected_gap"]
-        # منحنى ضغط الغياب: يرفع وزن العناصر التي تأخرت عن دورتها لمنع جمود التوقعات
         overdue_multiplier = 1.0 + min(1.40, math.pow(overdue_ratio, 1.15) * 0.48)
 
-        # 4. تصحيح التشبع في آخر 6 جولات (منع احتكار عنصر واحد للتوقعات)
         recent_window = history_slice[-6:]
         recent_share = recent_window.count(item) / len(recent_window)
         saturation_factor = 0.62 if recent_share > (prior * 2.1) else 1.08
 
-        # 5. منع نسخ آخر نتيجة تلقائياً إلا إذا كان السجل يظهر موجة تكرار حقيقية
         if item == last_1:
             anti_copy_factor = 0.92 if observed_repeat_rate >= 0.30 else 0.48
         else:
@@ -292,10 +320,6 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
 
 
 def _select_farm_top5(prob_map: Dict[str, float]) -> List[Tuple[str, float]]:
-    """
-    اختيار أقوى 5 عناصر لعجلة المزرعة مع ضمان عدم احتكار فئة ×5 لجميع المراكز
-    عندما ترتفع مؤشرات المضاعفات المتوسطة أو العالية.
-    """
     x5_items = [k for k, v in FARM_CATALOG.items() if v["group"] == "x5"]
     mult_items = [k for k, v in FARM_CATALOG.items() if v["group"] != "x5"]
 
@@ -313,7 +337,6 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
     top5 = _select_farm_top5(prob_map)
     top5_coverage = sum(p for _, p in top5)
 
-    # اختبار تاريخي صارم بدون تسريب للمستقبل (Walk-Forward Backtest)
     backtest_hits = 0
     backtest_trials = 0
     baseline_hits = 0
@@ -323,7 +346,7 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
 
     if n >= 4:
         for t in range(3, n):
-            past_only = clean_hist[:t]  # لا يتضمن clean_hist[t] إطلاقاً
+            past_only = clean_hist[:t]
             step_probs = _farm_score_next_step(past_only)
             step_top5 = {k for k, _ in _select_farm_top5(step_probs)}
             actual_next = clean_hist[t]
@@ -436,9 +459,7 @@ def run_poker_engine(clean_hist: List[str], min_sample: int) -> Dict:
     ranked = sorted(probs.items(), key=lambda x: x[1], reverse=True)
     main_chair, main_p = ranked[0]
     alt_chair, alt_p = ranked[1]
-    combined_cov = main_p + alt_p
 
-    # اختبار تاريخي صارم لمقعدين (Primary + Backup) ومقعد واحد
     hits_dual = 0
     hits_single = 0
     trials = 0
@@ -490,7 +511,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, float, str]:
     last_item = non_tie[-1]
     opposite = "🐅 تايجر" if last_item == "🐉 تنين" else "🐉 تنين"
 
-    # حساب طول السلسلة الحالية
     streak = 1
     for i in range(n_nt - 2, -1, -1):
         if non_tie[i] == last_item:
@@ -498,7 +518,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, float, str]:
         else:
             break
 
-    # حساب مصفوفة الانتقال للأنماط (ماذا حدث سابقاً عندما وصلت السلسلة لهذا الطول أو بعد آخر نتيجتين؟)
     switches = sum(1 for i in range(1, n_nt) if non_tie[i] != non_tie[i - 1])
     repeats = sum(1 for i in range(1, n_nt) if non_tie[i] == non_tie[i - 1])
 
@@ -523,7 +542,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, float, str]:
         d_score = 0.6 * p_d + 0.4 * d_score
         t_score = 0.6 * p_t + 0.4 * t_score
 
-    # دمج ميل السلسلة مقابل الانعكاس
     if switches > repeats * 1.15:
         pattern_desc = f"نمط تبادلي نشط (Chop: {switches} تبديل مقابل {repeats} تكرار)"
         if opposite == "🐉 تنين":
@@ -566,7 +584,6 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
     n = len(norm_hist)
     pred_item, est_prob, pattern_desc = _dt_score_next_step(norm_hist)
 
-    # اختبار تاريخي صارم بدون تسريب للمستقبل
     hits = 0
     trials = 0
     if n >= 4:
@@ -610,7 +627,6 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
 
 
 def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
-    """فحص تكرار النتيجة 5 مرات متتالية دون افتراض حتمية الانعكاس"""
     if len(clean_hist) >= 5:
         last_five = clean_hist[-5:]
         if all(x == last_five[0] for x in last_five):
@@ -622,8 +638,104 @@ def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
 
 
 # =====================================================================
-# 4. نقاط النهاية (API Endpoints) مع حماية التكرار ومراقبة الصحة
+# 5. نقاط النهاية (API Endpoints) شاملة لوحة الأدمن والتحقق من الكود
 # =====================================================================
+
+@app.post("/api/admin/login")
+def admin_login_endpoint(req: AdminLoginRequest):
+    """التحقق من مصادقة لوحة تحكم الأدمن وفحص حالة الاتصال بقاعدة البيانات"""
+    clean_pass = req.password.strip()
+    if clean_pass == ADMIN_SECRET:
+        status_code, _ = supabase_server_request("licenses?select=key_code&limit=1", "GET")
+        db_connected = status_code == 200
+        return {
+            "ok": True,
+            "authenticated": True,
+            "db_connected": db_connected,
+            "message": "تم التحقق من صلاحيات الأدمن بنجاح.",
+        }
+    logger.warning("Failed admin login attempt.")
+    raise HTTPException(status_code=401, detail="كلمة المرور غير صحيحة.")
+
+
+@app.post("/api/license/verify")
+def verify_license_proxy(req: LicenseVerifyRequest):
+    """
+    نقطة تحقق مساندة عبر السيرفر في حال تعذر اتصال المتصفح المباشر بـ Supabase،
+    تميز بدقة بين: خطأ الاتصال، الكود غير الموجود، الكود المحظور، المنتهي، والمرتبط بجهاز آخر.
+    """
+    clean_code = req.key_code.strip().upper()
+    encoded_code = urllib.parse.quote(clean_code)
+    status_code, rows = supabase_server_request(
+        f"licenses?key_code=eq.{encoded_code}&select=*&order=created_at.desc&limit=1",
+        "GET",
+    )
+
+    if status_code != 200 or not isinstance(rows, list):
+        return {
+            "ok": False,
+            "error_type": "DB_QUERY_ERROR",
+            "message": "تعذر الوصول إلى جدول التراخيص في قاعدة البيانات.",
+        }
+
+    if len(rows) == 0:
+        return {
+            "ok": False,
+            "error_type": "KEY_NOT_FOUND",
+            "message": "❌ هذا المفتاح غير موجود في قاعدة البيانات!",
+        }
+
+    record = rows[0]
+    if record.get("status") == "banned":
+        return {
+            "ok": False,
+            "error_type": "KEY_BANNED",
+            "message": "🚫 هذا المفتاح محظور سحابياً وتم إيقافه!",
+        }
+
+    bound_dev = record.get("bound_device")
+    if bound_dev and bound_dev != req.device_token:
+        return {
+            "ok": False,
+            "error_type": "DEVICE_MISMATCH",
+            "message": "🚨 هذا الكود مستخدم بالفعل على جهاز آخر ولا يمكن مشاركته!",
+        }
+
+    # حساب الصلاحية الزمنية
+    try:
+        created_str = record.get("created_at", "")
+        created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        created_ms = int(created_dt.timestamp() * 1000)
+    except Exception:
+        created_ms = int(time.time() * 1000)
+
+    duration_mins = int(record.get("duration_minutes") or 60)
+    expiry_ms = created_ms + (duration_mins * 60 * 1000)
+    now_ms = int(time.time() * 1000)
+
+    if expiry_ms <= now_ms:
+        return {
+            "ok": False,
+            "error_type": "KEY_EXPIRED",
+            "message": "⚠️ هذا الكود انتهت صلاحيته الزمنية بالكامل!",
+        }
+
+    if not bound_dev:
+        supabase_server_request(
+            f"licenses?key_code=eq.{encoded_code}",
+            "PATCH",
+            {"bound_device": req.device_token},
+        )
+
+    return {
+        "ok": True,
+        "error_type": None,
+        "key_code": clean_code,
+        "duration_minutes": duration_mins,
+        "expiry_ms": expiry_ms,
+        "remaining_minutes": round((expiry_ms - now_ms) / 60000.0, 2),
+    }
+
 
 @app.get("/api/health")
 def health_check():
@@ -631,7 +743,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.0",
+        "version": "120.1",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -664,13 +776,11 @@ async def predict_endpoint(req: PredictionRequest):
     clean_hist = [normalize_item_name(h) for h in req.history if h and h.strip()]
     room_key = f"{game}:{req.room_id or 'default'}"
 
-    # دمج وحفظ سجل الغرفة لمنع ضياع السجل عند الراحة أو انقطاع اتصال المستخدم
     if clean_hist:
         lifecycle.room_histories[room_key] = clean_hist[-100:]
     elif room_key in lifecycle.room_histories:
         clean_hist = lifecycle.room_histories[room_key]
 
-    # حماية من تكرار المهام المتطابقة (Task Deduplication)
     payload_signature = hashlib.sha256(
         f"{game}|{room_key}|{'|'.join(clean_hist)}|{req.coins}".encode("utf-8")
     ).hexdigest()
@@ -683,7 +793,6 @@ async def predict_endpoint(req: PredictionRequest):
             cached_copy["deduplicated"] = True
             return cached_copy
 
-    # تنظيم المهام المتزامنة عند ارتفاع الضغط (Concurrency Control)
     async with lifecycle.semaphore:
         lifecycle.active_tasks += 1
         try:
@@ -700,7 +809,6 @@ async def predict_endpoint(req: PredictionRequest):
             is_warn, warn_text = detect_streak_anomaly(clean_hist)
             pred_html = res["prediction_html"]
 
-            # إضافة شريط حالة دورة التشغيل الحقيقية للسيرفر
             pred_html += (
                 f"<br><span style='font-size:9px;color:#fbbf24;'>"
                 f"⚙️ [حالة الخدمة]: {state_meta['mode_label']} | مراجعة الـ 7س القادمة بعد: {state_meta['next_checkpoint_hours']}س"
@@ -713,7 +821,6 @@ async def predict_endpoint(req: PredictionRequest):
                     f"<hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
                 )
 
-            # حساب إدارة المحفظة المحافظة بناءً على حجم العينة ووجود تحذير تذبذب
             if len(clean_hist) < min_s:
                 bet_ratio = 0.03
             elif is_warn:
@@ -754,8 +861,8 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.0 Online",
-        "endpoints": ["/api/predict", "/api/health", "/api/config"],
+        "status": "Phantom Statistical & Lifecycle Server v120.1 Online",
+        "endpoints": ["/api/predict", "/api/health", "/api/config", "/api/admin/login", "/api/license/verify"],
     }
 
 
