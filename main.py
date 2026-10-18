@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.1")
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +71,8 @@ class PredictionRequest(BaseModel):
     client_hour: Optional[int] = None
     client_minute: Optional[int] = None
     force_refresh: Optional[bool] = False
+    poker_primary_ratio: Optional[float] = Field(default=0.65, ge=0.50, le=0.90)
+    poker_alt_ratio: Optional[float] = Field(default=0.35, ge=0.10, le=0.50)
 
 
 # =====================================================================
@@ -78,17 +80,12 @@ class PredictionRequest(BaseModel):
 # =====================================================================
 
 def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict] = None) -> Tuple[int, any]:
-    """
-    اتصال خلفي بقاعدة بيانات Supabase باستخدام المفتاح المعتمد بدون كسر الترويسة
-    ليعمل كجسر احتياطي إذا واجه المتصفح مشكلة CORS أو شبكة.
-    """
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     headers = {
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    # إذا كان المفتاح بصيغة JWT تقليدية نضيف Authorization، أما sb_publishable فيعتمد على apikey
     if SUPABASE_KEY.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
     if method in ("POST", "PATCH"):
@@ -237,7 +234,7 @@ lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
 
 
 # =====================================================================
-# 4. المحركات الإحصائية المنفصلة للألعاب الثلاث (بدون تسريب للمستقبل)
+# 4. المحركات الإحصائية المنفصلة للألعاب الثلاث
 # =====================================================================
 
 FARM_CATALOG: Dict[str, Dict] = {
@@ -393,16 +390,27 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
     }
 
 
-def _poker_score_next_step(norm_hist: List[str]) -> Dict[str, float]:
+def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict[str, any]]:
+    """
+    حساب احتمالات الخانات الثلاث المتساوية في القواعد (A, B, C) بشكل مستقل:
+    - يسمح بتكرار النتيجة طبيعياً إذا كانت مصفوفة الانتقال أو سجل الطاولة يدعم التكرار.
+    - يتجنب التكرار الناتج عن خطأ برمجي ويفصل بين حساب كل خانة.
+    """
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
     n = len(norm_hist)
+    base_equal_prob = 1.0 / 3.0
+
     if n == 0:
-        return {c: 100.0 / 3.0 for c in chairs}
+        return (
+            {c: 100.0 / 3.0 for c in chairs},
+            {"repeat_rate": 0.333, "switch_rate": 0.667, "mode": "توزيع متكافئ قياسي (33.3% لكل خانة)"},
+        )
 
     counts = Counter(norm_hist)
     last_1 = norm_hist[-1]
     last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
 
+    # مصفوفة الانتقال من الدرجة الأولى: ماذا جاء فعلياً بعد الكرسي الأخير؟
     trans_1 = Counter()
     t1_total = 0
     for i in range(n - 1):
@@ -410,6 +418,7 @@ def _poker_score_next_step(norm_hist: List[str]) -> Dict[str, float]:
             trans_1[norm_hist[i + 1]] += 1
             t1_total += 1
 
+    # مصفوفة الانتقال من الدرجة الثانية: ماذا جاء بعد آخر جولتين؟
     trans_2 = Counter()
     t2_total = 0
     if last_2 and n >= 3:
@@ -418,33 +427,75 @@ def _poker_score_next_step(norm_hist: List[str]) -> Dict[str, float]:
                 trans_2[norm_hist[i + 2]] += 1
                 t2_total += 1
 
+    # قياس معدل التكرار الطبيعي مقابل التغيير في السجل الفعلي
     repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
-    rep_rate = (repeats / (n - 1)) if n > 1 else 0.33
+    rep_rate = (repeats / (n - 1)) if n > 1 else base_equal_prob
+    switch_rate = 1.0 - rep_rate
+
+    # حساب طول سلسلة التكرار الحالية
+    cur_streak = 1
+    for i in range(n - 2, -1, -1):
+        if norm_hist[i] == last_1:
+            cur_streak += 1
+        else:
+            break
 
     scores = {}
     for c in chairs:
-        emp = (counts.get(c, 0) + 1.0) / (n + 3.0)
-        p1 = (trans_1[c] + 0.7) / (t1_total + 2.1) if t1_total > 0 else emp
-        p2 = (trans_2[c] + 0.5) / (t2_total + 1.5) if t2_total > 0 else p1
+        # 1. التوزيع التاريخي الموزون بقاعدة التساوي الأساسية (1/3)
+        emp = (counts.get(c, 0) + 3.0 * base_equal_prob) / (n + 3.0)
+        # 2. انتقال الدرجة الأولى والثانية
+        p1 = (trans_1[c] + 1.5 * base_equal_prob) / (t1_total + 1.5) if t1_total > 0 else emp
+        p2 = (trans_2[c] + 1.0 * base_equal_prob) / (t2_total + 1.0) if t2_total > 0 else p1
 
+        # 3. فجوة الغياب لكل خانة
         if c in norm_hist:
             gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
         else:
-            gap = n + 1
+            gap = n
 
-        overdue_factor = 1.0 + min(0.45, (gap / 3.0) * 0.22)
+        overdue_factor = 1.0 + min(0.32, (gap / 3.0) * 0.14)
+
+        # 4. معالجة التكرار الطبيعي أو الاختلاف بناءً على بيانات السجل الحقيقية
         if c == last_1:
-            flow_factor = 1.08 if rep_rate > 0.42 else 0.72
+            if rep_rate >= 0.36 or (t1_total > 0 and (trans_1[c] / t1_total) >= 0.38):
+                # البيانات تدعم احتمالية التكرار الطبيعي
+                flow_factor = 1.06
+            elif cur_streak >= 4:
+                # تحذير تشبع دون منع التكرار نهائياً
+                flow_factor = 0.88
+            else:
+                flow_factor = 0.94
         else:
-            flow_factor = 1.12 if rep_rate <= 0.42 else 0.92
+            flow_factor = 1.05 if switch_rate >= 0.65 else 0.98
 
-        scores[c] = (0.25 * emp + 0.45 * p1 + 0.30 * p2) * overdue_factor * flow_factor
+        scores[c] = (0.30 * emp + 0.45 * p1 + 0.25 * p2) * overdue_factor * flow_factor
 
     total = sum(scores.values()) or 1.0
-    return {c: (scores[c] / total) * 100.0 for c in chairs}
+    prob_map = {c: (scores[c] / total) * 100.0 for c in chairs}
+
+    if rep_rate >= 0.40:
+        mode_desc = f"ميل للتكرار الطبيعي ({rep_rate*100:.0f}% تكرار)"
+    elif switch_rate >= 0.72:
+        mode_desc = f"ميل للتناوب بين الخانات ({switch_rate*100:.0f}% تغيير)"
+    else:
+        mode_desc = f"توزيع متوازن (تكرار {rep_rate*100:.0f}% | تغيير {switch_rate*100:.0f}%)"
+
+    return prob_map, {
+        "repeat_rate": round(rep_rate * 100.0, 1),
+        "switch_rate": round(switch_rate * 100.0, 1),
+        "current_streak": cur_streak,
+        "mode": mode_desc,
+    }
 
 
-def run_poker_engine(clean_hist: List[str], min_sample: int) -> Dict:
+def run_poker_engine(
+    clean_hist: List[str],
+    min_sample: int,
+    coins: int = 0,
+    primary_ratio: float = 0.65,
+    alt_ratio: float = 0.35,
+) -> Dict:
     norm_hist = []
     for h in clean_hist:
         if "A" in h:
@@ -455,50 +506,115 @@ def run_poker_engine(clean_hist: List[str], min_sample: int) -> Dict:
             norm_hist.append("🔴 كرسي C")
 
     n = len(norm_hist)
-    probs = _poker_score_next_step(norm_hist)
+    probs, diag = _poker_score_next_step(norm_hist)
     ranked = sorted(probs.items(), key=lambda x: x[1], reverse=True)
-    main_chair, main_p = ranked[0]
-    alt_chair, alt_p = ranked[1]
 
-    hits_dual = 0
-    hits_single = 0
+    primary_chair, primary_p = ranked[0]
+    alt_chair, alt_p = ranked[1]
+    third_chair, third_p = ranked[2]
+    dual_coverage = primary_p + alt_p
+
+    # اختبار Walk-Forward منفصل للبوكر الأساسي وللبوكر البديل (بدون تسريب للمستقبل)
+    hits_primary = 0
+    hits_alt = 0
     trials = 0
     if n >= 4:
         for t in range(3, n):
-            sub_probs = _poker_score_next_step(norm_hist[:t])
+            sub_probs, _ = _poker_score_next_step(norm_hist[:t])
             sub_ranked = sorted(sub_probs.items(), key=lambda x: x[1], reverse=True)
-            if norm_hist[t] == sub_ranked[0][0]:
-                hits_single += 1
-            if norm_hist[t] in (sub_ranked[0][0], sub_ranked[1][0]):
-                hits_dual += 1
+            actual = norm_hist[t]
+            if actual == sub_ranked[0][0]:
+                hits_primary += 1
+            elif actual == sub_ranked[1][0]:
+                hits_alt += 1
             trials += 1
 
-    dual_acc = (hits_dual / trials * 100.0) if trials > 0 else 0.0
-    single_acc = (hits_single / trials * 100.0) if trials > 0 else 0.0
+    primary_acc = (hits_primary / trials * 100.0) if trials > 0 else 0.0
+    alt_acc = (hits_alt / trials * 100.0) if trials > 0 else 0.0
+    combined_acc = ((hits_primary + hits_alt) / trials * 100.0) if trials > 0 else 0.0
+
+    # حساب الرهان المنفصل للأساسي والبديل (إجمالي المخاطرة المقترحة 6% من المحفظة)
+    total_round_stake = int(coins * (0.03 if n < min_sample else 0.06)) if coins > 0 else 0
+    # ضمان أن رهان البديل أقل من الأساسي كما هو مطلوب
+    norm_p_ratio = max(0.55, min(0.85, primary_ratio / max(0.01, primary_ratio + alt_ratio)))
+    norm_a_ratio = 1.0 - norm_p_ratio
+    primary_bet = int(round(total_round_stake * norm_p_ratio))
+    alt_bet = max(0, total_round_stake - primary_bet)
 
     last_chair_str = norm_hist[-1] if n > 0 else "لا يوجد"
+    is_repeat_prediction = (n > 0 and primary_chair == norm_hist[-1])
+    relation_tag = "توقع تكرار طبيعي للخانة" if is_repeat_prediction else "توقع انتقال لخانة مختلفة"
+
     if n < min_sample:
-        status_line = f"⚠️ [البيانات غير كافية لجزم نمط]: مسجل {n}/{min_sample} جولات (المرجع النظري لمقعدين: 66.7%)."
+        status_line = (
+            f"⚠️ [عينة أولية {n}/{min_sample} جولات]: القواعد الأساسية متساوية (33.3% لكل خانة). "
+            f"لا توجد علاقة تنبؤية جازمة بعد."
+        )
         conf_str = f"عينة أولية ({n} جولات)"
     else:
         status_line = (
-            f"📊 [اختبار Walk-Forward على {trials} جولة]: "
-            f"إصابة(أساسي+بديل)={dual_acc:.1f}% | إصابة(أساسي فقط)={single_acc:.1f}% | آخر جولة: {last_chair_str}"
+            f"📊 [اختبار Walk-Forward ({trials} جولة)]: "
+            f"إصابة الأساسي={primary_acc:.1f}% | إصابة البديل={alt_acc:.1f}% | التغطية المزدوجة={combined_acc:.1f}%"
         )
-        conf_str = f"اختبار فعلي: {dual_acc:.1f}% (عينة: {n})"
+        conf_str = f"تغطية الاختبار: {combined_acc:.1f}% (عينة: {n})"
 
     pred_html = (
-        f"⭐ التوقع المستقل للجولة التالية: {main_chair} ({main_p:.1f}%)<br>"
-        f"🔄 التغطية البديلة: {alt_chair} ({alt_p:.1f}%)<br>"
-        f"<span style='font-size:9px;color:#93c5fd;'>{status_line}</span>"
+        f"<div style='margin-bottom:4px;font-size:10px;color:#cbd5e1;'>"
+        f"⚖️ <strong>توزيع الخانات الثلاث:</strong> "
+        f"A: {probs['🟢 كرسي A']:.1f}% | B: {probs['🔵 كرسي B']:.1f}% | C: {probs['🔴 كرسي C']:.1f}%"
+        f"</div>"
+        f"<div style='background:#052e16;border:1px solid #10b981;padding:5px;border-radius:5px;margin-bottom:4px;'>"
+        f"🎯 <strong>[1] البوكر الأساسي (الخانة الأولى):</strong> {primary_chair} — احتمال: <strong>{primary_p:.1f}%</strong> ({relation_tag})<br>"
+        f"<span style='font-size:9px;color:#6ee7b7;'>💰 الرهان الأساسي المقترح ({int(norm_p_ratio*100)}%): {primary_bet} كوينز | دقة الأساسي تاريخياً: {primary_acc:.1f}%</span>"
+        f"</div>"
+        f"<div style='background:#172554;border:1px solid #3b82f6;padding:5px;border-radius:5px;margin-bottom:4px;'>"
+        f"🛡️ <strong>[2] البوكر البديل المستقل (خانة التغطية الثانية):</strong> {alt_chair} — احتمال مستقل: <strong>{alt_p:.1f}%</strong><br>"
+        f"<span style='font-size:9px;color:#93c5fd;'>💰 الرهان البديل الأقل ({int(norm_a_ratio*100)}%): {alt_bet} كوينز | دقة البديل تاريخياً: {alt_acc:.1f}% | مستبعد: {third_chair} ({third_p:.1f}%)</span>"
+        f"</div>"
+        f"<span style='font-size:9px;color:#93c5fd;'>{status_line} | آخر نتيجة مسجلة: {last_chair_str}</span>"
     )
-    log_msg = f"[POKER-ENGINE] N={n} | DualHit={hits_dual}/{trials} ({dual_acc:.1f}%) | Baseline=66.7%"
+
+    log_msg = (
+        f"[POKER-ENGINE] N={n} | Primary={primary_chair}({primary_p:.1f}%) | "
+        f"Alt={alt_chair}({alt_p:.1f}%) | DualHit={combined_acc:.1f}%"
+    )
+
     return {
         "prediction_html": pred_html,
         "confidence": conf_str,
         "engine_log": log_msg,
-        "measured_accuracy": round(dual_acc, 1) if trials > 0 else None,
+        "measured_accuracy": round(combined_acc, 1) if trials > 0 else None,
         "baseline_accuracy": 66.7,
+        "poker_details": {
+            "seat_probabilities": {
+                "A": round(probs["🟢 كرسي A"], 1),
+                "B": round(probs["🔵 كرسي B"], 1),
+                "C": round(probs["🔴 كرسي C"], 1),
+            },
+            "primary": {
+                "chair": primary_chair,
+                "probability": round(primary_p, 1),
+                "bet": primary_bet,
+                "ratio_percent": int(round(norm_p_ratio * 100)),
+                "historical_hit_rate": round(primary_acc, 1),
+                "relation": relation_tag,
+            },
+            "alternate": {
+                "chair": alt_chair,
+                "probability": round(alt_p, 1),
+                "bet": alt_bet,
+                "ratio_percent": int(round(norm_a_ratio * 100)),
+                "historical_hit_rate": round(alt_acc, 1),
+            },
+            "excluded": {
+                "chair": third_chair,
+                "probability": round(third_p, 1),
+            },
+            "dual_coverage_prob": round(dual_coverage, 1),
+            "total_stake": total_round_stake,
+            "diagnostics": diag,
+            "sample_size": n,
+        },
     }
 
 
@@ -638,12 +754,11 @@ def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
 
 
 # =====================================================================
-# 5. نقاط النهاية (API Endpoints) شاملة لوحة الأدمن والتحقق من الكود
+# 5. نقاط النهاية (API Endpoints)
 # =====================================================================
 
 @app.post("/api/admin/login")
 def admin_login_endpoint(req: AdminLoginRequest):
-    """التحقق من مصادقة لوحة تحكم الأدمن وفحص حالة الاتصال بقاعدة البيانات"""
     clean_pass = req.password.strip()
     if clean_pass == ADMIN_SECRET:
         status_code, _ = supabase_server_request("licenses?select=key_code&limit=1", "GET")
@@ -660,10 +775,6 @@ def admin_login_endpoint(req: AdminLoginRequest):
 
 @app.post("/api/license/verify")
 def verify_license_proxy(req: LicenseVerifyRequest):
-    """
-    نقطة تحقق مساندة عبر السيرفر في حال تعذر اتصال المتصفح المباشر بـ Supabase،
-    تميز بدقة بين: خطأ الاتصال، الكود غير الموجود، الكود المحظور، المنتهي، والمرتبط بجهاز آخر.
-    """
     clean_code = req.key_code.strip().upper()
     encoded_code = urllib.parse.quote(clean_code)
     status_code, rows = supabase_server_request(
@@ -701,7 +812,6 @@ def verify_license_proxy(req: LicenseVerifyRequest):
             "message": "🚨 هذا الكود مستخدم بالفعل على جهاز آخر ولا يمكن مشاركته!",
         }
 
-    # حساب الصلاحية الزمنية
     try:
         created_str = record.get("created_at", "")
         created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
@@ -743,7 +853,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.1",
+        "version": "120.3",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -782,7 +892,7 @@ async def predict_endpoint(req: PredictionRequest):
         clean_hist = lifecycle.room_histories[room_key]
 
     payload_signature = hashlib.sha256(
-        f"{game}|{room_key}|{'|'.join(clean_hist)}|{req.coins}".encode("utf-8")
+        f"{game}|{room_key}|{'|'.join(clean_hist)}|{req.coins}|{req.poker_primary_ratio}|{req.poker_alt_ratio}".encode("utf-8")
     ).hexdigest()
 
     now = time.time()
@@ -797,10 +907,18 @@ async def predict_endpoint(req: PredictionRequest):
         lifecycle.active_tasks += 1
         try:
             min_s = lifecycle.config.min_sample_for_pattern
+            poker_details = None
             if "FARM" in game:
                 res = run_farm_engine(clean_hist, min_s)
             elif "POKER" in game:
-                res = run_poker_engine(clean_hist, min_s)
+                res = run_poker_engine(
+                    clean_hist,
+                    min_s,
+                    coins=req.coins,
+                    primary_ratio=req.poker_primary_ratio or 0.65,
+                    alt_ratio=req.poker_alt_ratio or 0.35,
+                )
+                poker_details = res.get("poker_details")
             elif "DRAGON" in game:
                 res = run_dragon_tiger_engine(clean_hist, min_s)
             else:
@@ -841,6 +959,7 @@ async def predict_endpoint(req: PredictionRequest):
                 "sample_size": len(clean_hist),
                 "measured_accuracy": res["measured_accuracy"],
                 "baseline_accuracy": res["baseline_accuracy"],
+                "poker_details": poker_details,
                 "deduplicated": False,
             }
 
@@ -861,7 +980,7 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.1 Online",
+        "status": "Phantom Statistical & Lifecycle Server v120.3 Online",
         "endpoints": ["/api/predict", "/api/health", "/api/config", "/api/admin/login", "/api/license/verify"],
     }
 
