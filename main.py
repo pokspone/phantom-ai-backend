@@ -11,7 +11,7 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.4")
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,7 +81,7 @@ class PredictionRequest(BaseModel):
 # 2. مساعد اتصال قاعدة البيانات الخلفي (Supabase Proxy Helper)
 # =====================================================================
 
-def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict] = None) -> Tuple[int, any]:
+def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -126,11 +126,11 @@ class ServerLifecycleManager:
         self.checkpoints_completed = 0
         self.active_tasks = 0
         self.recent_request_timestamps: List[float] = []
-        self.dedup_cache: Dict[str, Tuple[float, Dict]] = {}
+        self.dedup_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self.room_histories: Dict[str, List[str]] = {}
         self.game_request_counts: Dict[str, int] = {"DRAGON": 0, "FARM": 0, "POKER": 0}
-        self.audit_logs: List[Dict] = []
-        self.error_logs: List[Dict] = []
+        self.audit_logs: List[Dict[str, str]] = []
+        self.error_logs: List[Dict[str, str]] = []
         self.failed_admin_attempts: Dict[str, List[float]] = {}
         self.active_admin_tokens: Dict[str, float] = {}
         self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
@@ -176,7 +176,7 @@ class ServerLifecycleManager:
     def create_admin_session(self, client_ip: str) -> str:
         self.failed_admin_attempts.pop(client_ip, None)
         token = secrets.token_hex(24)
-        self.active_admin_tokens[token] = time.time() + 14400.0  # صالحة لمدة 4 ساعات
+        self.active_admin_tokens[token] = time.time() + 14400.0
         return token
 
     def verify_admin_token(self, token: Optional[str]) -> bool:
@@ -233,7 +233,7 @@ class ServerLifecycleManager:
         self.recent_request_timestamps = [t for t in self.recent_request_timestamps if now - t <= 60.0]
         return len(self.recent_request_timestamps)
 
-    def evaluate_lifecycle_state(self, is_incoming_prediction: bool = False) -> Dict:
+    def evaluate_lifecycle_state(self, is_incoming_prediction: bool = False) -> Dict[str, Any]:
         now = time.time()
         rpm = self.get_requests_per_minute()
         hours_since_checkpoint = (now - self.last_checkpoint_time) / 3600.0
@@ -295,14 +295,14 @@ class ServerLifecycleManager:
 
 
 lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
-lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.4 initialized.")
+lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.5 initialized.")
 
 
 # =====================================================================
 # 4. المحركات الإحصائية المنفصلة للألعاب الثلاث
 # =====================================================================
 
-FARM_CATALOG: Dict[str, Dict] = {
+FARM_CATALOG: Dict[str, Dict[str, Any]] = {
     "🍅 طماطم (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
     "🌽 ذرة (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
     "🥬 خس (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
@@ -393,7 +393,7 @@ def _select_farm_top5(prob_map: Dict[str, float]) -> List[Tuple[str, float]]:
     return [(k, prob_map[k]) for k in selected_sorted]
 
 
-def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
+def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict[str, Any]:
     n = len(clean_hist)
     prob_map = _farm_score_next_step(clean_hist)
     top5 = _select_farm_top5(prob_map)
@@ -455,7 +455,7 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
     }
 
 
-def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict[str, any]]:
+def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict[str, Any]]:
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
     n = len(norm_hist)
     base_equal_prob = 1.0 / 3.0
@@ -463,7 +463,7 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
     if n == 0:
         return (
             {c: 100.0 / 3.0 for c in chairs},
-            {"repeat_rate": 0.333, "switch_rate": 0.667, "mode": "توزيع متكافئ قياسي (33.3% لكل خانة)"},
+            {"repeat_rate": 33.3, "switch_rate": 66.7, "current_streak": 0, "mode": "توزيع متكافئ قياسي (33.3% لكل خانة)"},
         )
 
     counts = Counter(norm_hist)
@@ -496,7 +496,7 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
         else:
             break
 
-    scores = {}
+    scores: Dict[str, float] = {}
     for c in chairs:
         emp = (counts.get(c, 0) + 3.0 * base_equal_prob) / (n + 3.0)
         p1 = (trans_1[c] + 1.5 * base_equal_prob) / (t1_total + 1.5) if t1_total > 0 else emp
@@ -545,7 +545,7 @@ def run_poker_engine(
     coins: int = 0,
     primary_ratio: float = 0.65,
     alt_ratio: float = 0.35,
-) -> Dict:
+) -> Dict[str, Any]:
     norm_hist = []
     for h in clean_hist:
         if "A" in h:
@@ -666,10 +666,7 @@ def run_poker_engine(
 
 
 # =====================================================================
-# 4.3 إصلاح محرك Dragon Tiger:
-# - عدم عكس النتيجة المدخلة تلقائياً
-# - السماح بتكرار التوقع عندما يدعم السجل ذلك
-# - معالجة التعادل (Tie) باعتباره نتيجة نادرة (~7.4%) دون مبالغة أو استبعاد تام
+# 4.3 محرك Dragon Tiger المصحح بالكامل (بدون عكس الاختيار + معالجة التعادل النادر)
 # =====================================================================
 
 def _normalize_dt_symbol(raw_str: str) -> Optional[str]:
@@ -683,11 +680,6 @@ def _normalize_dt_symbol(raw_str: str) -> Optional[str]:
 
 
 def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], str, str]:
-    """
-    حساب احتمالات Dragon Tiger للثلاث نتائج (تنين، تايجر، تعادل) بدون انحياز مصطنع لعكس الاختيار:
-    - الأوزان المرجعية النظرية: تنين 46.3%، تايجر 46.3%، تعادل 7.4%.
-    - يدمج التكرار الفعلي، ومصفوفة الانتقال من الدرجة الأولى والثانية، وسلوك السلاسل (Streak) مقابل التناوب (Chop).
-    """
     priors = {"🐉 تنين": 0.463, "🐅 تايجر": 0.463, "🤝 تعادل": 0.074}
     n = len(norm_hist)
 
@@ -696,14 +688,13 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
             "🐉 تنين",
             {"🐉 تنين": 46.3, "🐅 تايجر": 46.3, "🤝 تعادل": 7.4},
             "توزيع مرجعي متكافئ (لا توجد جولات مسجلة بعد)",
-            "تقدير افتتاحي محايد",
+            "احتمال التعادل المرجعي: 7.4% (حدث نادر)",
         )
 
     counts = Counter(norm_hist)
     last_1 = norm_hist[-1]
     last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
 
-    # انتقال الدرجة الأولى من النتيجة الأخيرة (شاملة التنين والتايجر والتعادل)
     trans_1 = Counter()
     t1_total = 0
     for i in range(n - 1):
@@ -711,7 +702,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
             trans_1[norm_hist[i + 1]] += 1
             t1_total += 1
 
-    # انتقال الدرجة الثانية من آخر جولتين
     trans_2 = Counter()
     t2_total = 0
     if last_2 and n >= 3:
@@ -720,12 +710,11 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
                 trans_2[norm_hist[i + 2]] += 1
                 t2_total += 1
 
-    # تحليل السلاسل والتناوب على نتائج الحسم (تنين / تايجر) دون تجاهل التعادل
     decisive_seq = [x for x in norm_hist if x in ("🐉 تنين", "🐅 تايجر")]
     n_dec = len(decisive_seq)
     repeats = sum(1 for i in range(1, n_dec) if decisive_seq[i] == decisive_seq[i - 1])
     switches = sum(1 for i in range(1, n_dec) if decisive_seq[i] != decisive_seq[i - 1])
-    total_ transitions_dec = max(1, repeats + switches)
+    total_transitions_dec = max(1, repeats + switches)
     repeat_ratio = repeats / total_transitions_dec if (repeats + switches) > 0 else 0.50
     switch_ratio = switches / total_transitions_dec if (repeats + switches) > 0 else 0.50
 
@@ -738,7 +727,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
             else:
                 break
 
-    # حساب الفجوة منذ آخر تعادل لتقييم التعادل كحدث نادر (~13.5 جولة في المتوسط)
     if "🤝 تعادل" in norm_hist:
         last_tie_pos = len(norm_hist) - 1 - norm_hist[::-1].index("🤝 تعادل")
         tie_gap = (n - 1) - last_tie_pos
@@ -747,7 +735,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
 
     scores: Dict[str, float] = {}
     for outcome, prior_p in priors.items():
-        # تقدير بايزي محافظ (معامل تنعيم قوي للتعادل لمنع المبالغة في توقعه)
         alpha = 6.0 if outcome != "🤝 تعادل" else 14.0
         emp = (counts.get(outcome, 0) + alpha * prior_p) / (n + alpha)
         p1 = (trans_1[outcome] + 3.0 * prior_p) / (t1_total + 3.0) if t1_total > 0 else emp
@@ -756,23 +743,19 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
         base_blend = 0.35 * emp + 0.40 * p1 + 0.25 * p2
 
         if outcome == "🤝 تعادل":
-            # التعادل نادر: يرتفع وزنه تدريجياً فقط إذا طال غيابه كثيراً وكان السجل يدعم تردده
             overdue_tie_boost = 1.0 + min(0.35, max(0, tie_gap - 12) * 0.025)
             scores[outcome] = base_blend * overdue_tie_boost
         else:
-            # للنتيجتين الرئيسيتين (تنين / تايجر): لا نعكس النتيجة المدخلة قسرياً!
             flow_mod = 1.0
             if last_decisive:
                 if outcome == last_decisive:
-                    # إذا كان السجل يدعم استمرار نفس الاختيار (Streak) أو في الجولات الأولى
                     if n_dec == 1:
-                        flow_mod = 1.02  # الحفاظ على اتجاه النتيجة المدخلة وعدم عكسها
+                        flow_mod = 1.02
                     elif repeat_ratio >= 0.50 or cur_streak >= 2:
                         flow_mod = 1.0 + min(0.18, (repeat_ratio - 0.45) * 0.45 + (cur_streak * 0.02))
                     else:
                         flow_mod = 0.94
                 else:
-                    # الخيار المعاكس يرتفع فقط إذا أثبت السجل فعلياً وجود نمط تبادلي واضح (Chop)
                     if n_dec >= 2 and switch_ratio > 0.58:
                         flow_mod = 1.0 + min(0.18, (switch_ratio - 0.50) * 0.45)
                     else:
@@ -782,7 +765,6 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
     total_s = sum(scores.values()) or 1.0
     prob_map = {k: (v / total_s) * 100.0 for k, v in scores.items()}
 
-    # تحديد التوقع المستقبلي: التعادل لا يتصدر التوقع الرئيسي إلا إذا تجاوزت أدلته عتبة صارمة، وإلا يظل مؤشراً ثانوياً نادراً
     if prob_map["🤝 تعادل"] >= 22.0 and prob_map["🤝 تعادل"] > max(prob_map["🐉 تنين"], prob_map["🐅 تايجر"]):
         predicted = "🤝 تعادل"
     elif prob_map["🐉 تنين"] >= prob_map["🐅 تايجر"]:
@@ -791,7 +773,7 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
         predicted = "🐅 تايجر"
 
     if n_dec <= 1:
-        pattern_desc = f"عينة أولية ({n} جولة) — استقرار مع آخر نتيجة مدخلة دون عكس مصطنع"
+        pattern_desc = f"عينة أولية ({n} جولة) — استقرار مع النتيجة المدخلة دون عكس مصطنع"
     elif repeat_ratio >= 0.55:
         pattern_desc = f"نمط متسلسل يدعم التكرار (Streak={cur_streak} | تكرار={repeats} مقابل تبديل={switches})"
     elif switch_ratio >= 0.58:
@@ -808,7 +790,7 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
     return predicted, prob_map, pattern_desc, tie_note
 
 
-def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
+def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict[str, Any]:
     norm_hist = []
     for h in clean_hist:
         sym = _normalize_dt_symbol(h)
@@ -819,7 +801,6 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
     pred_item, prob_map, pattern_desc, tie_note = _dt_score_next_step(norm_hist)
     est_prob = prob_map.get(pred_item, 46.3)
 
-    # اختبار Walk-Forward صارم بدون تسريب للمستقبل
     hits = 0
     trials = 0
     if n >= 4:
@@ -944,7 +925,6 @@ def admin_login_endpoint(req: AdminLoginRequest, request: Request):
 
 @app.get("/api/admin/telemetry")
 def admin_telemetry_endpoint(x_admin_token: Optional[str] = Header(default=None)):
-    """إرجاع إحصائيات السيرفر الحقيقية وسجل الأنشطة والأخطاء للرسوم البيانية في لوحة التحكم"""
     state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
     token_valid = lifecycle.verify_admin_token(x_admin_token)
     room_summary = {k: len(v) for k, v in lifecycle.room_histories.items()}
@@ -1042,7 +1022,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.4",
+        "version": "120.5",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1176,7 +1156,7 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.4 Online",
+        "status": "Phantom Statistical & Lifecycle Server v120.5 Online",
         "endpoints": [
             "/api/predict",
             "/api/health",
