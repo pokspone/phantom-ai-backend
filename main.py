@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.5")
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +42,7 @@ ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "JAKYMR77")
 
 
 # =====================================================================
-# 1. نماذج البيانات والإعدادات ومصادقة الأدمن
+# 1. نماذج البيانات والإعدادات ومصادقة الأدمن (محفوظة كما هي)
 # =====================================================================
 
 class RuntimeConfig(BaseModel):
@@ -78,7 +78,7 @@ class PredictionRequest(BaseModel):
 
 
 # =====================================================================
-# 2. مساعد اتصال قاعدة البيانات الخلفي (Supabase Proxy Helper)
+# 2. مساعد اتصال قاعدة البيانات الخلفي (Supabase Proxy Helper - محفوظ كما هو)
 # =====================================================================
 
 def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
@@ -110,7 +110,7 @@ def supabase_server_request(path: str, method: str = "GET", payload: Optional[Di
 
 
 # =====================================================================
-# 3. مدير التشغيل والأمان وسجل الأنشطة الإدارية (Lifecycle & Security Manager)
+# 3. مدير التشغيل والأمان وسجل الأنشطة الإدارية (محفوظ كما هو)
 # =====================================================================
 
 class ServerLifecycleManager:
@@ -295,11 +295,11 @@ class ServerLifecycleManager:
 
 
 lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
-lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.5 initialized.")
+lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.6 initialized.")
 
 
 # =====================================================================
-# 4. المحركات الإحصائية المنفصلة للألعاب الثلاث
+# 4.1 و 4.2 محركا المزرعة والبوكر (محفوظان كما هما تماماً بدون أي تعديل)
 # =====================================================================
 
 FARM_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -666,35 +666,52 @@ def run_poker_engine(
 
 
 # =====================================================================
-# 4.3 محرك Dragon Tiger المصحح بالكامل (بدون عكس الاختيار + معالجة التعادل النادر)
+# 4.3 إصلاح جذري لمحرك Dragon Tiger وفق قواعد اللعبة الفعلية في HiFami:
+# - التعرف الصحيح على Dragon (🐉 تنين) و Tiger (🐅 تايجر) و Tie (🤝 تعادل)
+# - إزالة النسخ التلقائي لآخر نتيجة مدخلة وإزالة العكس الإجباري
+# - تحليل تتابعي حقيقي (Order-1 & Order-2 Markov + Window Balance + Streak/Chop)
+# - معالجة Tie كنتيجة مستقلة ونادرة (~7.46%) داخل التسلسل دون حذفها أو تضخيمها
 # =====================================================================
 
 def _normalize_dt_symbol(raw_str: str) -> Optional[str]:
-    if "تنين" in raw_str or "DRAGON" in raw_str.upper():
+    if not raw_str:
+        return None
+    s = str(raw_str).strip()
+    upper_s = s.upper()
+    if "تنين" in s or "DRAGON" in upper_s or "🐉" in s:
         return "🐉 تنين"
-    if "تايجر" in raw_str or "TIGER" in raw_str.upper():
+    if "تايجر" in s or "نمر" in s or "TIGER" in upper_s or "🐅" in s:
         return "🐅 تايجر"
-    if "تعادل" in raw_str or "TIE" in raw_str.upper():
+    if "تعادل" in s or "TIE" in upper_s or "🤝" in s:
         return "🤝 تعادل"
     return None
 
 
-def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], str, str]:
-    priors = {"🐉 تنين": 0.463, "🐅 تايجر": 0.463, "🤝 تعادل": 0.074}
+def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], str, str, str]:
+    """
+    حساب التوزيع الاحتمالي للجولة القادمة في Dragon Tiger استناداً إلى السجل الفعلي:
+    - القواعد المرجعية (8-Deck Shoe): Dragon = 46.27%، Tiger = 46.27%، Tie = 7.46%.
+    - يقرأ السجل بالترتيب الزمني الدقيق دون حذف Tie من مصفوفة الانتقال.
+    - لا ينسخ آخر نتيجة تلقائياً عند غياب النمط، ولا يعكسها إجبارياً.
+    """
+    priors = {"🐉 تنين": 0.4627, "🐅 تايجر": 0.4627, "🤝 تعادل": 0.0746}
+    outcomes = ["🐉 تنين", "🐅 تايجر", "🤝 تعادل"]
     n = len(norm_hist)
 
     if n == 0:
         return (
-            "🐉 تنين",
+            "⚖️ متكافئ (انتظار بيانات السجل)",
             {"🐉 تنين": 46.3, "🐅 تايجر": 46.3, "🤝 تعادل": 7.4},
-            "توزيع مرجعي متكافئ (لا توجد جولات مسجلة بعد)",
-            "احتمال التعادل المرجعي: 7.4% (حدث نادر)",
+            "لا توجد جولات مسجلة بعد — القواعد القياسية متكافئة (46.3% تنين | 46.3% تايجر | 7.4% تعادل)",
+            "احتمال التعادل المرجعي: 7.4% (حدث نادر نسبياً — مرة كل ~13.4 جولة)",
+            "بانتظار إدخال الجولات لتحليل مصفوفة الانتقال",
         )
 
     counts = Counter(norm_hist)
     last_1 = norm_hist[-1]
     last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
 
+    # 1. مصفوفة الانتقال من الدرجة الأولى على التسلسل الحقيقي الكامل (شاملة Tie)
     trans_1 = Counter()
     t1_total = 0
     for i in range(n - 1):
@@ -702,6 +719,7 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
             trans_1[norm_hist[i + 1]] += 1
             t1_total += 1
 
+    # 2. مصفوفة الانتقال من الدرجة الثانية (ماذا ظهر تاريخياً بعد آخر زوج من النتائج؟)
     trans_2 = Counter()
     t2_total = 0
     if last_2 and n >= 3:
@@ -710,23 +728,37 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
                 trans_2[norm_hist[i + 2]] += 1
                 t2_total += 1
 
-    decisive_seq = [x for x in norm_hist if x in ("🐉 تنين", "🐅 تايجر")]
-    n_dec = len(decisive_seq)
-    repeats = sum(1 for i in range(1, n_dec) if decisive_seq[i] == decisive_seq[i - 1])
-    switches = sum(1 for i in range(1, n_dec) if decisive_seq[i] != decisive_seq[i - 1])
-    total_transitions_dec = max(1, repeats + switches)
-    repeat_ratio = repeats / total_transitions_dec if (repeats + switches) > 0 else 0.50
-    switch_ratio = switches / total_transitions_dec if (repeats + switches) > 0 else 0.50
-
-    cur_streak = 0
-    last_decisive = decisive_seq[-1] if decisive_seq else None
-    if last_decisive:
-        for i in range(n_dec - 1, -1, -1):
-            if decisive_seq[i] == last_decisive:
-                cur_streak += 1
+    # 3. تحليل التكرار مقابل التناوب في التسلسل الزمني الفعلي
+    adj_repeats = 0
+    adj_switches = 0
+    for i in range(1, n):
+        if norm_hist[i] in ("🐉 تنين", "🐅 تايجر") and norm_hist[i - 1] in ("🐉 تنين", "🐅 تايجر"):
+            if norm_hist[i] == norm_hist[i - 1]:
+                adj_repeats += 1
             else:
-                break
+                adj_switches += 1
 
+    total_adj_pairs = adj_repeats + adj_switches
+    repeat_rate = (adj_repeats / total_adj_pairs) if total_adj_pairs > 0 else 0.50
+    switch_rate = (adj_switches / total_adj_pairs) if total_adj_pairs > 0 else 0.50
+
+    # حساب طول السلسلة الحالية لآخر نتيجة فعلية (سواء تنين أو تايجر أو تعادل)
+    cur_streak = 1
+    for i in range(n - 2, -1, -1):
+        if norm_hist[i] == last_1:
+            cur_streak += 1
+        else:
+            break
+
+    # 4. توازن النافذة القصيرة (آخر 8 جولات) لرصد التشبع أو النقص الإحصائي
+    recent_window = norm_hist[-8:]
+    rec_d = recent_window.count("🐉 تنين")
+    rec_t = recent_window.count("🐅 تايجر")
+    rec_decisive = max(1, rec_d + rec_t)
+    d_window_share = rec_d / rec_decisive
+    t_window_share = rec_t / rec_decisive
+
+    # 5. فجوة غياب التعادل النادر (متوسط دورته الطبيعية ~13.4 جولة)
     if "🤝 تعادل" in norm_hist:
         last_tie_pos = len(norm_hist) - 1 - norm_hist[::-1].index("🤝 تعادل")
         tie_gap = (n - 1) - last_tie_pos
@@ -734,60 +766,105 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
         tie_gap = n
 
     scores: Dict[str, float] = {}
-    for outcome, prior_p in priors.items():
-        alpha = 6.0 if outcome != "🤝 تعادل" else 14.0
-        emp = (counts.get(outcome, 0) + alpha * prior_p) / (n + alpha)
-        p1 = (trans_1[outcome] + 3.0 * prior_p) / (t1_total + 3.0) if t1_total > 0 else emp
-        p2 = (trans_2[outcome] + 2.0 * prior_p) / (t2_total + 2.0) if t2_total > 0 else p1
-
-        base_blend = 0.35 * emp + 0.40 * p1 + 0.25 * p2
+    for outcome in outcomes:
+        prior_p = priors[outcome]
 
         if outcome == "🤝 تعادل":
-            overdue_tie_boost = 1.0 + min(0.35, max(0, tie_gap - 12) * 0.025)
-            scores[outcome] = base_blend * overdue_tie_boost
+            # تنعيم بايزي قوي للتعادل يمنع المبالغة في توقعه مع الحفاظ على استقلاله
+            alpha_tie = 14.0
+            emp_tie = (counts.get(outcome, 0) + alpha_tie * prior_p) / (n + alpha_tie)
+            p1_tie = (trans_1[outcome] + 4.0 * prior_p) / (t1_total + 4.0) if t1_total > 0 else emp_tie
+            p2_tie = (trans_2[outcome] + 3.0 * prior_p) / (t2_total + 3.0) if t2_total > 0 else p1_tie
+            base_tie = 0.40 * emp_tie + 0.35 * p1_tie + 0.25 * p2_tie
+
+            # إذا غاب التعادل أكثر من دورته المتوقعة (14 جولة) وكان له ظهور سابق، يرتفع وزنه بشكل معتدل
+            overdue_boost = 1.0 + min(0.30, max(0, tie_gap - 13) * 0.02)
+            # منع توقع تعادلين متتاليين إلا إذا تكرر ذلك فعلياً في السجل
+            immediate_tie_mod = 0.78 if (last_1 == "🤝 تعادل" and trans_1["🤝 تعادل"] == 0) else 1.0
+            scores[outcome] = base_tie * overdue_boost * immediate_tie_mod
         else:
-            flow_mod = 1.0
-            if last_decisive:
-                if outcome == last_decisive:
-                    if n_dec == 1:
-                        flow_mod = 1.02
-                    elif repeat_ratio >= 0.50 or cur_streak >= 2:
-                        flow_mod = 1.0 + min(0.18, (repeat_ratio - 0.45) * 0.45 + (cur_streak * 0.02))
+            # حساب التنين والتايجر بدون أي انحياز مسبق لنسخ أو عكس النتيجة الأخيرة
+            alpha_main = 6.0
+            emp_main = (counts.get(outcome, 0) + alpha_main * prior_p) / (n + alpha_main)
+            p1_main = (trans_1[outcome] + 2.5 * prior_p) / (t1_total + 2.5) if t1_total > 0 else emp_main
+            p2_main = (trans_2[outcome] + 1.8 * prior_p) / (t2_total + 1.8) if t2_total > 0 else p1_main
+
+            # وزن الانتقال الشرطي الفعلي من السجل يمثل المحرك الأساسي
+            base_main = 0.28 * emp_main + 0.42 * p1_main + 0.30 * p2_main
+
+            # تقييم سلوك السلاسل (Streak) مقابل التناوب (Chop) فقط عند توفر انتقالات فعلية كافية (total_adj_pairs >= 2)
+            pattern_mod = 1.0
+            if last_1 in ("🐉 تنين", "🐅 تايجر") and total_adj_pairs >= 2:
+                if repeat_rate >= 0.58:
+                    # البيانات الفعلية في السجل تُثبت ميل الطاولة لتكرار نفس النتيجة (Streak)
+                    if outcome == last_1:
+                        pattern_mod = 1.0 + min(0.16, (repeat_rate - 0.50) * 0.40)
                     else:
-                        flow_mod = 0.94
-                else:
-                    if n_dec >= 2 and switch_ratio > 0.58:
-                        flow_mod = 1.0 + min(0.18, (switch_ratio - 0.50) * 0.45)
+                        pattern_mod = 0.94
+                elif switch_rate >= 0.58:
+                    # البيانات الفعلية في السجل تُثبت ميل الطاولة للتناوب العكسي (Chop)
+                    if outcome != last_1:
+                        pattern_mod = 1.0 + min(0.16, (switch_rate - 0.50) * 0.40)
                     else:
-                        flow_mod = 0.98
-            scores[outcome] = base_blend * flow_mod
+                        pattern_mod = 0.94
+
+            # تصحيح التوازن الإحصائي الطفيف عندما لا يكون هناك نمط سلاسل مهيمن
+            balance_mod = 1.0
+            if n >= 2 and repeat_rate < 0.58:
+                outcome_share = d_window_share if outcome == "🐉 تنين" else t_window_share
+                # الكفة الأقل ظهوراً في النافذة الأخيرة تحصل على تصحيح توازن إحصائي طفيف
+                balance_mod = 1.0 + ((0.50 - outcome_share) * 0.08)
+
+            scores[outcome] = base_main * pattern_mod * balance_mod
 
     total_s = sum(scores.values()) or 1.0
     prob_map = {k: (v / total_s) * 100.0 for k, v in scores.items()}
 
-    if prob_map["🤝 تعادل"] >= 22.0 and prob_map["🤝 تعادل"] > max(prob_map["🐉 تنين"], prob_map["🐅 تايجر"]):
+    d_prob = prob_map["🐉 تنين"]
+    t_prob = prob_map["🐅 تايجر"]
+    tie_prob = prob_map["🤝 تعادل"]
+    diff_dt = abs(d_prob - t_prob)
+
+    # تحديد التوقع المستقبلي وسبب القرار بشفافية إحصائية
+    if tie_prob >= 20.0 and tie_prob > max(d_prob, t_prob):
         predicted = "🤝 تعادل"
-    elif prob_map["🐉 تنين"] >= prob_map["🐅 تايجر"]:
+        decision_reason = f"ارتفاع وزن التعادل إحصائياً ({tie_prob:.1f}%) بناءً على مصفوفة الانتقال وفجوة الغياب ({tie_gap} جولة)"
+    elif n < 2 or diff_dt < 0.35:
+        # في حال تسجيل جولة واحدة فقط أو تساوي الكفتين تماماً، لا ننسخ ولا نعكس عشوائياً بل نعرض الأوزان المتقاربة بوضوح
+        predicted = "🐉 تنين" if d_prob >= t_prob else "🐅 تايجر"
+        decision_reason = (
+            f"البيانات الحالية ({n} جولة) تُظهر تقارباً إحصائياً شبه متكافئ "
+            f"(فارق {diff_dt:.2f}% فقط) — لا يوجد نمط حاسم بعد"
+        )
+    elif d_prob > t_prob:
         predicted = "🐉 تنين"
+        if last_1 == "🐉 تنين":
+            decision_reason = f"السجل يدعم استمرار السلسلة (تنين) بناءً على معدل التكرار ({repeat_rate*100:.0f}%) ومصفوفة الانتقال"
+        else:
+            decision_reason = f"ترجيح الانتقال إلى (تنين) بناءً على معدل التناوب ({switch_rate*100:.0f}%) ومصفوفة الانتقال بعد ({last_1})"
     else:
         predicted = "🐅 تايجر"
+        if last_1 == "🐅 تايجر":
+            decision_reason = f"السجل يدعم استمرار السلسلة (تايجر) بناءً على معدل التكرار ({repeat_rate*100:.0f}%) ومصفوفة الانتقال"
+        else:
+            decision_reason = f"ترجيح الانتقال إلى (تايجر) بناءً على معدل التناوب ({switch_rate*100:.0f}%) ومصفوفة الانتقال بعد ({last_1})"
 
-    if n_dec <= 1:
-        pattern_desc = f"عينة أولية ({n} جولة) — استقرار مع النتيجة المدخلة دون عكس مصطنع"
-    elif repeat_ratio >= 0.55:
-        pattern_desc = f"نمط متسلسل يدعم التكرار (Streak={cur_streak} | تكرار={repeats} مقابل تبديل={switches})"
-    elif switch_ratio >= 0.58:
-        pattern_desc = f"نمط تبادلي (Chop: تبديل={switches} مقابل تكرار={repeats})"
+    if total_adj_pairs == 0:
+        pattern_desc = f"جولة واحدة مسجلة ({last_1}) — يلزم إدخال جولات إضافية لرصد التكرار أو التناوب"
+    elif repeat_rate >= 0.58:
+        pattern_desc = f"نمط سلاسل نشط (Streak={cur_streak} | تكرار={adj_repeats} مقابل تبديل={adj_switches})"
+    elif switch_rate >= 0.58:
+        pattern_desc = f"نمط تناوب عكسي (Chop: تبديل={adj_switches} مقابل تكرار={adj_repeats})"
     else:
-        pattern_desc = f"توزيع متوازن بين التنين والتايجر (تكرار={repeats}, تبديل={switches})"
+        pattern_desc = f"توزيع مختلط متوازن (تكرار={adj_repeats}, تبديل={adj_switches})"
 
     tie_note = (
-        f"احتمال التعادل النادر: {prob_map['🤝 تعادل']:.1f}% (غائب منذ {tie_gap} جولة)"
-        if prob_map["🤝 تعادل"] < 14.0
-        else f"⚠️ مؤشر التعادل النادر مرتفع نسبياً: {prob_map['🤝 تعادل']:.1f}% (غائب منذ {tie_gap} جولة)"
+        f"احتمال التعادل المستقل: {tie_prob:.1f}% (المرجع النظري 7.4% | غائب منذ {tie_gap} جولة)"
+        if tie_prob < 13.5
+        else f"⚠️ مؤشر التعادل المستقل مرتفع نسبياً: {tie_prob:.1f}% (غائب منذ {tie_gap} جولة)"
     )
 
-    return predicted, prob_map, pattern_desc, tie_note
+    return predicted, prob_map, pattern_desc, tie_note, decision_reason
 
 
 def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict[str, Any]:
@@ -798,14 +875,15 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict[str,
             norm_hist.append(sym)
 
     n = len(norm_hist)
-    pred_item, prob_map, pattern_desc, tie_note = _dt_score_next_step(norm_hist)
+    pred_item, prob_map, pattern_desc, tie_note, decision_reason = _dt_score_next_step(norm_hist)
     est_prob = prob_map.get(pred_item, 46.3)
 
+    # اختبار Walk-Forward على الجولات السابقة (تبدأ المقارنة من الجولة 4 لمنع تسريب المستقبل)
     hits = 0
     trials = 0
     if n >= 4:
         for t in range(3, n):
-            step_pred, _, _, _ = _dt_score_next_step(norm_hist[:t])
+            step_pred, _, _, _, _ = _dt_score_next_step(norm_hist[:t])
             if step_pred == norm_hist[t]:
                 hits += 1
             trials += 1
@@ -816,37 +894,50 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict[str,
     tie_c = norm_hist.count("🤝 تعادل")
     last_recorded = norm_hist[-1] if n > 0 else "لا يوجد"
     is_repeat_pred = (n > 0 and pred_item == last_recorded)
-    rel_label = "توقع تكرار نفس النتيجة السابقة" if is_repeat_pred else "توقع انتقال لنتيجة أخرى"
+
+    if n == 0:
+        rel_label = "بانتظار تسجيل الجولات"
+    elif is_repeat_pred:
+        rel_label = "تكرار مدعوم ببيانات السجل"
+    else:
+        rel_label = "انتقال لنتيجة مختلفة وفق التحليل"
 
     if n < min_sample:
         info_line = (
-            f"⚠️ [البيانات غير كافية لجزم علاقة تنبؤية]: مسجل {n}/{min_sample} جولات "
-            f"(المرجع النظري: تنين 46.3% | تايجر 46.3% | تعادل 7.4%)."
+            f"⚠️ [عينة غير كافية لجزم نمط ({n}/{min_sample} جولات)]: اللعبة تعتمد على RNG مستقل في السيرفر "
+            f"(الاحتمال النظري: تنين 46.3% | تايجر 46.3% | تعادل 7.4%)."
         )
-        conf_str = f"عينة أولية ({n} جولات)"
+        conf_str = f"عينة أولية ({n}/{min_sample})"
     else:
         info_line = (
-            f"📊 [اختبار Walk-Forward على {trials} جولة]: "
-            f"الدقة المحققة {measured_acc:.1f}% (المرجع 46.3%) | السجل: تنين({d_c}) تايجر({t_c}) تعادل({tie_c})"
+            f"📊 [اختبار Walk-Forward على {trials} جولة سابقة]: "
+            f"نسبة الإصابة الفعلية {measured_acc:.1f}% (مقابل مرجع نظري 46.3%) | "
+            f"إحصاء السجل: تنين({d_c}) تايجر({t_c}) تعادل({tie_c})"
         )
         conf_str = f"اختبار فعلي: {measured_acc:.1f}% (عينة: {n})"
 
     pred_html = (
-        f"<div style='margin-bottom:4px;font-size:10px;color:#cbd5e1;'>"
-        f"📌 <strong>آخر نتيجة مدخلة في السجل (جولة #{n}):</strong> <span style='color:#fbbf24;'>{last_recorded}</span> "
-        f"| <strong>توزيع الأوزان:</strong> تنين {prob_map['🐉 تنين']:.1f}% | تايجر {prob_map['🐅 تايجر']:.1f}% | تعادل {prob_map['🤝 تعادل']:.1f}%"
+        f"<div style='margin-bottom:5px;padding:4px 6px;background:#090d16;border:1px solid #1e293b;border-radius:5px;font-size:10px;color:#cbd5e1;'>"
+        f"📥 <strong>آخر نتيجة مسجلة في الـ History (جولة #{n}):</strong> "
+        f"<span style='color:#fbbf24;font-weight:bold;'>{last_recorded}</span><br>"
+        f"⚖️ <strong>الأوزان المحسوبة للجولة #{n+1}:</strong> "
+        f"🐉 تنين: <strong>{prob_map['🐉 تنين']:.1f}%</strong> | "
+        f"🐅 تايجر: <strong>{prob_map['🐅 تايجر']:.1f}%</strong> | "
+        f"🤝 تعادل: <strong>{prob_map['🤝 تعادل']:.1f}%</strong>"
         f"</div>"
-        f"<div style='background:#052e16;border:1px solid #10b981;padding:5px;border-radius:5px;margin-bottom:4px;'>"
-        f"⚡ <strong>التقدير المستقبلي المستقل للجولة القادمة (#{n+1}):</strong> {pred_item} — وزن: <strong>{est_prob:.1f}%</strong> ({rel_label})<br>"
-        f"<span style='font-size:9px;color:#6ee7b7;'>🤝 [تحليل التعادل النادر]: {tie_note}</span>"
+        f"<div style='background:#052e16;border:1px solid #10b981;padding:6px;border-radius:6px;margin-bottom:5px;'>"
+        f"⚡ <strong>التقدير الإحصائي للجولة القادمة (#{n+1}):</strong> "
+        f"<span style='color:#34d399;font-size:12px;'>{pred_item}</span> — وزن: <strong>{est_prob:.1f}%</strong> [{rel_label}]<br>"
+        f"<span style='font-size:9.5px;color:#a7f3d0;'>🔍 الأساس التحليلي: {decision_reason}</span><br>"
+        f"<span style='font-size:9px;color:#fde68a;'>🤝 {tie_note}</span>"
         f"</div>"
-        f"<span style='font-size:9px;color:#cbd5e1;'>[تشخيص السجل: {pattern_desc}]</span><br>"
+        f"<span style='font-size:9px;color:#cbd5e1;'>[حالة السلسلة: {pattern_desc}]</span><br>"
         f"<span style='font-size:9px;color:#93c5fd;'>{info_line}</span>"
     )
 
     log_msg = (
-        f"[DT-ENGINE] N={n} | LastIn={last_recorded} | NextPred={pred_item}({est_prob:.1f}%) | "
-        f"TieProb={prob_map['🤝 تعادل']:.1f}% | Hit={hits}/{trials}"
+        f"[DT-ENGINE] N={n} | HistoryLast={last_recorded} | NextEst={pred_item}({est_prob:.1f}%) | "
+        f"Tie={prob_map['🤝 تعادل']:.1f}% | Backtest={hits}/{trials}"
     )
 
     return {
@@ -859,6 +950,7 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict[str,
             "last_recorded": last_recorded,
             "predicted_next": pred_item,
             "is_repeat_prediction": is_repeat_pred,
+            "decision_reason": decision_reason,
             "probabilities": {
                 "dragon": round(prob_map["🐉 تنين"], 1),
                 "tiger": round(prob_map["🐅 تايجر"], 1),
@@ -884,7 +976,7 @@ def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
 
 
 # =====================================================================
-# 5. نقاط النهاية (API Endpoints) شاملة الأمان وإحصائيات لوحة التحكم
+# 5. نقاط النهاية (API Endpoints - محفوظة كما هي)
 # =====================================================================
 
 @app.post("/api/admin/login")
@@ -1022,7 +1114,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.5",
+        "version": "120.6",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1156,7 +1248,7 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.5 Online",
+        "status": "Phantom Statistical & Lifecycle Server v120.6 Online",
         "endpoints": [
             "/api/predict",
             "/api/health",
