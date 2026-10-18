@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import time
 import urllib.parse
 import urllib.request
@@ -12,7 +13,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -24,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.3")
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +57,7 @@ class RuntimeConfig(BaseModel):
 
 class AdminLoginRequest(BaseModel):
     password: str
+    trigger_clicks: Optional[int] = 6
 
 
 class LicenseVerifyRequest(BaseModel):
@@ -108,7 +110,7 @@ def supabase_server_request(path: str, method: str = "GET", payload: Optional[Di
 
 
 # =====================================================================
-# 3. مدير التشغيل والموارد ودورة الـ 7 ساعات (Lifecycle & Load Manager)
+# 3. مدير التشغيل والأمان وسجل الأنشطة الإدارية (Lifecycle & Security Manager)
 # =====================================================================
 
 class ServerLifecycleManager:
@@ -126,8 +128,63 @@ class ServerLifecycleManager:
         self.recent_request_timestamps: List[float] = []
         self.dedup_cache: Dict[str, Tuple[float, Dict]] = {}
         self.room_histories: Dict[str, List[str]] = {}
+        self.game_request_counts: Dict[str, int] = {"DRAGON": 0, "FARM": 0, "POKER": 0}
+        self.audit_logs: List[Dict] = []
+        self.error_logs: List[Dict] = []
+        self.failed_admin_attempts: Dict[str, List[float]] = {}
+        self.active_admin_tokens: Dict[str, float] = {}
         self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
         self.load_persisted_state()
+
+    def record_audit_event(self, event_type: str, details: str, severity: str = "INFO"):
+        entry = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "type": event_type,
+            "severity": severity,
+            "details": details,
+        }
+        self.audit_logs.append(entry)
+        if len(self.audit_logs) > 80:
+            self.audit_logs = self.audit_logs[-80:]
+
+    def record_error_event(self, source: str, message: str):
+        self.error_count += 1
+        entry = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "source": source,
+            "message": message[:160],
+        }
+        self.error_logs.append(entry)
+        if len(self.error_logs) > 50:
+            self.error_logs = self.error_logs[-50:]
+
+    def check_admin_rate_limit(self, client_ip: str) -> Tuple[bool, int]:
+        now = time.time()
+        attempts = [t for t in self.failed_admin_attempts.get(client_ip, []) if now - t < 300.0]
+        self.failed_admin_attempts[client_ip] = attempts
+        if len(attempts) >= 5:
+            wait_secs = int(300.0 - (now - attempts[0]))
+            return False, max(1, wait_secs)
+        return True, 0
+
+    def register_admin_failure(self, client_ip: str):
+        now = time.time()
+        attempts = [t for t in self.failed_admin_attempts.get(client_ip, []) if now - t < 300.0]
+        attempts.append(now)
+        self.failed_admin_attempts[client_ip] = attempts
+
+    def create_admin_session(self, client_ip: str) -> str:
+        self.failed_admin_attempts.pop(client_ip, None)
+        token = secrets.token_hex(24)
+        self.active_admin_tokens[token] = time.time() + 14400.0  # صالحة لمدة 4 ساعات
+        return token
+
+    def verify_admin_token(self, token: Optional[str]) -> bool:
+        if not token:
+            return False
+        now = time.time()
+        self.active_admin_tokens = {k: exp for k, exp in self.active_admin_tokens.items() if exp > now}
+        return token in self.active_admin_tokens
 
     def load_persisted_state(self):
         if os.path.exists(self.state_file):
@@ -137,6 +194,8 @@ class ServerLifecycleManager:
                 self.total_requests = data.get("total_requests", 0)
                 self.checkpoints_completed = data.get("checkpoints_completed", 0)
                 self.room_histories = data.get("room_histories", {})
+                self.game_request_counts = data.get("game_request_counts", {"DRAGON": 0, "FARM": 0, "POKER": 0})
+                self.audit_logs = data.get("audit_logs", [])[-80:]
                 saved_cfg = data.get("config")
                 if saved_cfg:
                     self.config = RuntimeConfig(**saved_cfg)
@@ -155,6 +214,8 @@ class ServerLifecycleManager:
                 "checkpoints_completed": self.checkpoints_completed,
                 "config": self.config.dict(),
                 "room_histories": self.room_histories,
+                "game_request_counts": self.game_request_counts,
+                "audit_logs": self.audit_logs[-80:],
             }
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -164,6 +225,7 @@ class ServerLifecycleManager:
     def update_config(self, new_cfg: RuntimeConfig):
         self.config = new_cfg
         self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
+        self.record_audit_event("CONFIG_UPDATE", f"Cycle={new_cfg.review_cycle_hours}h, MaxTasks={new_cfg.max_concurrent_tasks}")
         self.save_persisted_state()
 
     def get_requests_per_minute(self) -> int:
@@ -185,6 +247,7 @@ class ServerLifecycleManager:
             }
             self.last_checkpoint_time = now
             self.checkpoints_completed += 1
+            self.record_audit_event("CHECKPOINT_7H", f"Completed checkpoint #{self.checkpoints_completed}")
             logger.info(f"7-Hour Checkpoint #{self.checkpoints_completed} completed without data loss.")
 
         if is_incoming_prediction:
@@ -227,10 +290,12 @@ class ServerLifecycleManager:
             "checkpoints_completed": self.checkpoints_completed,
             "total_requests": self.total_requests,
             "error_count": self.error_count,
+            "game_request_counts": self.game_request_counts,
         }
 
 
 lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
+lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.4 initialized.")
 
 
 # =====================================================================
@@ -391,11 +456,6 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
 
 
 def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict[str, any]]:
-    """
-    حساب احتمالات الخانات الثلاث المتساوية في القواعد (A, B, C) بشكل مستقل:
-    - يسمح بتكرار النتيجة طبيعياً إذا كانت مصفوفة الانتقال أو سجل الطاولة يدعم التكرار.
-    - يتجنب التكرار الناتج عن خطأ برمجي ويفصل بين حساب كل خانة.
-    """
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
     n = len(norm_hist)
     base_equal_prob = 1.0 / 3.0
@@ -410,7 +470,6 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
     last_1 = norm_hist[-1]
     last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
 
-    # مصفوفة الانتقال من الدرجة الأولى: ماذا جاء فعلياً بعد الكرسي الأخير؟
     trans_1 = Counter()
     t1_total = 0
     for i in range(n - 1):
@@ -418,7 +477,6 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
             trans_1[norm_hist[i + 1]] += 1
             t1_total += 1
 
-    # مصفوفة الانتقال من الدرجة الثانية: ماذا جاء بعد آخر جولتين؟
     trans_2 = Counter()
     t2_total = 0
     if last_2 and n >= 3:
@@ -427,12 +485,10 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
                 trans_2[norm_hist[i + 2]] += 1
                 t2_total += 1
 
-    # قياس معدل التكرار الطبيعي مقابل التغيير في السجل الفعلي
     repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
     rep_rate = (repeats / (n - 1)) if n > 1 else base_equal_prob
     switch_rate = 1.0 - rep_rate
 
-    # حساب طول سلسلة التكرار الحالية
     cur_streak = 1
     for i in range(n - 2, -1, -1):
         if norm_hist[i] == last_1:
@@ -442,13 +498,10 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
 
     scores = {}
     for c in chairs:
-        # 1. التوزيع التاريخي الموزون بقاعدة التساوي الأساسية (1/3)
         emp = (counts.get(c, 0) + 3.0 * base_equal_prob) / (n + 3.0)
-        # 2. انتقال الدرجة الأولى والثانية
         p1 = (trans_1[c] + 1.5 * base_equal_prob) / (t1_total + 1.5) if t1_total > 0 else emp
         p2 = (trans_2[c] + 1.0 * base_equal_prob) / (t2_total + 1.0) if t2_total > 0 else p1
 
-        # 3. فجوة الغياب لكل خانة
         if c in norm_hist:
             gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
         else:
@@ -456,13 +509,10 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
 
         overdue_factor = 1.0 + min(0.32, (gap / 3.0) * 0.14)
 
-        # 4. معالجة التكرار الطبيعي أو الاختلاف بناءً على بيانات السجل الحقيقية
         if c == last_1:
             if rep_rate >= 0.36 or (t1_total > 0 and (trans_1[c] / t1_total) >= 0.38):
-                # البيانات تدعم احتمالية التكرار الطبيعي
                 flow_factor = 1.06
             elif cur_streak >= 4:
-                # تحذير تشبع دون منع التكرار نهائياً
                 flow_factor = 0.88
             else:
                 flow_factor = 0.94
@@ -514,7 +564,6 @@ def run_poker_engine(
     third_chair, third_p = ranked[2]
     dual_coverage = primary_p + alt_p
 
-    # اختبار Walk-Forward منفصل للبوكر الأساسي وللبوكر البديل (بدون تسريب للمستقبل)
     hits_primary = 0
     hits_alt = 0
     trials = 0
@@ -533,9 +582,7 @@ def run_poker_engine(
     alt_acc = (hits_alt / trials * 100.0) if trials > 0 else 0.0
     combined_acc = ((hits_primary + hits_alt) / trials * 100.0) if trials > 0 else 0.0
 
-    # حساب الرهان المنفصل للأساسي والبديل (إجمالي المخاطرة المقترحة 6% من المحفظة)
     total_round_stake = int(coins * (0.03 if n < min_sample else 0.06)) if coins > 0 else 0
-    # ضمان أن رهان البديل أقل من الأساسي كما هو مطلوب
     norm_p_ratio = max(0.55, min(0.85, primary_ratio / max(0.01, primary_ratio + alt_ratio)))
     norm_a_ratio = 1.0 - norm_p_ratio
     primary_bet = int(round(total_round_stake * norm_p_ratio))
@@ -618,95 +665,166 @@ def run_poker_engine(
     }
 
 
-def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, float, str]:
-    non_tie = [x for x in norm_hist if x != "🤝 تعادل"]
-    if not non_tie:
-        return "🐉 تنين", 46.3, "توزيع مرجعي متكافئ (لا توجد بيانات حسم)"
+# =====================================================================
+# 4.3 إصلاح محرك Dragon Tiger:
+# - عدم عكس النتيجة المدخلة تلقائياً
+# - السماح بتكرار التوقع عندما يدعم السجل ذلك
+# - معالجة التعادل (Tie) باعتباره نتيجة نادرة (~7.4%) دون مبالغة أو استبعاد تام
+# =====================================================================
 
-    n_nt = len(non_tie)
-    last_item = non_tie[-1]
-    opposite = "🐅 تايجر" if last_item == "🐉 تنين" else "🐉 تنين"
+def _normalize_dt_symbol(raw_str: str) -> Optional[str]:
+    if "تنين" in raw_str or "DRAGON" in raw_str.upper():
+        return "🐉 تنين"
+    if "تايجر" in raw_str or "TIGER" in raw_str.upper():
+        return "🐅 تايجر"
+    if "تعادل" in raw_str or "TIE" in raw_str.upper():
+        return "🤝 تعادل"
+    return None
 
-    streak = 1
-    for i in range(n_nt - 2, -1, -1):
-        if non_tie[i] == last_item:
-            streak += 1
-        else:
-            break
 
-    switches = sum(1 for i in range(1, n_nt) if non_tie[i] != non_tie[i - 1])
-    repeats = sum(1 for i in range(1, n_nt) if non_tie[i] == non_tie[i - 1])
+def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], str, str]:
+    """
+    حساب احتمالات Dragon Tiger للثلاث نتائج (تنين، تايجر، تعادل) بدون انحياز مصطنع لعكس الاختيار:
+    - الأوزان المرجعية النظرية: تنين 46.3%، تايجر 46.3%، تعادل 7.4%.
+    - يدمج التكرار الفعلي، ومصفوفة الانتقال من الدرجة الأولى والثانية، وسلوك السلاسل (Streak) مقابل التناوب (Chop).
+    """
+    priors = {"🐉 تنين": 0.463, "🐅 تايجر": 0.463, "🤝 تعادل": 0.074}
+    n = len(norm_hist)
 
-    if n_nt >= 3:
-        last_pair = (non_tie[-2], non_tie[-1])
-        pair_next = Counter()
-        pair_total = 0
-        for i in range(n_nt - 2):
-            if (non_tie[i], non_tie[i + 1]) == last_pair:
-                pair_next[non_tie[i + 2]] += 1
-                pair_total += 1
+    if n == 0:
+        return (
+            "🐉 تنين",
+            {"🐉 تنين": 46.3, "🐅 تايجر": 46.3, "🤝 تعادل": 7.4},
+            "توزيع مرجعي متكافئ (لا توجد جولات مسجلة بعد)",
+            "تقدير افتتاحي محايد",
+        )
+
+    counts = Counter(norm_hist)
+    last_1 = norm_hist[-1]
+    last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
+
+    # انتقال الدرجة الأولى من النتيجة الأخيرة (شاملة التنين والتايجر والتعادل)
+    trans_1 = Counter()
+    t1_total = 0
+    for i in range(n - 1):
+        if norm_hist[i] == last_1:
+            trans_1[norm_hist[i + 1]] += 1
+            t1_total += 1
+
+    # انتقال الدرجة الثانية من آخر جولتين
+    trans_2 = Counter()
+    t2_total = 0
+    if last_2 and n >= 3:
+        for i in range(n - 2):
+            if (norm_hist[i], norm_hist[i + 1]) == last_2:
+                trans_2[norm_hist[i + 2]] += 1
+                t2_total += 1
+
+    # تحليل السلاسل والتناوب على نتائج الحسم (تنين / تايجر) دون تجاهل التعادل
+    decisive_seq = [x for x in norm_hist if x in ("🐉 تنين", "🐅 تايجر")]
+    n_dec = len(decisive_seq)
+    repeats = sum(1 for i in range(1, n_dec) if decisive_seq[i] == decisive_seq[i - 1])
+    switches = sum(1 for i in range(1, n_dec) if decisive_seq[i] != decisive_seq[i - 1])
+    total_ transitions_dec = max(1, repeats + switches)
+    repeat_ratio = repeats / total_transitions_dec if (repeats + switches) > 0 else 0.50
+    switch_ratio = switches / total_transitions_dec if (repeats + switches) > 0 else 0.50
+
+    cur_streak = 0
+    last_decisive = decisive_seq[-1] if decisive_seq else None
+    if last_decisive:
+        for i in range(n_dec - 1, -1, -1):
+            if decisive_seq[i] == last_decisive:
+                cur_streak += 1
+            else:
+                break
+
+    # حساب الفجوة منذ آخر تعادل لتقييم التعادل كحدث نادر (~13.5 جولة في المتوسط)
+    if "🤝 تعادل" in norm_hist:
+        last_tie_pos = len(norm_hist) - 1 - norm_hist[::-1].index("🤝 تعادل")
+        tie_gap = (n - 1) - last_tie_pos
     else:
-        pair_next = Counter()
-        pair_total = 0
+        tie_gap = n
 
-    d_score = 0.5
-    t_score = 0.5
+    scores: Dict[str, float] = {}
+    for outcome, prior_p in priors.items():
+        # تقدير بايزي محافظ (معامل تنعيم قوي للتعادل لمنع المبالغة في توقعه)
+        alpha = 6.0 if outcome != "🤝 تعادل" else 14.0
+        emp = (counts.get(outcome, 0) + alpha * prior_p) / (n + alpha)
+        p1 = (trans_1[outcome] + 3.0 * prior_p) / (t1_total + 3.0) if t1_total > 0 else emp
+        p2 = (trans_2[outcome] + 2.0 * prior_p) / (t2_total + 2.0) if t2_total > 0 else p1
 
-    if pair_total > 0:
-        p_d = (pair_next["🐉 تنين"] + 0.5) / (pair_total + 1.0)
-        p_t = (pair_next["🐅 تايجر"] + 0.5) / (pair_total + 1.0)
-        d_score = 0.6 * p_d + 0.4 * d_score
-        t_score = 0.6 * p_t + 0.4 * t_score
+        base_blend = 0.35 * emp + 0.40 * p1 + 0.25 * p2
 
-    if switches > repeats * 1.15:
-        pattern_desc = f"نمط تبادلي نشط (Chop: {switches} تبديل مقابل {repeats} تكرار)"
-        if opposite == "🐉 تنين":
-            d_score += 0.14
+        if outcome == "🤝 تعادل":
+            # التعادل نادر: يرتفع وزنه تدريجياً فقط إذا طال غيابه كثيراً وكان السجل يدعم تردده
+            overdue_tie_boost = 1.0 + min(0.35, max(0, tie_gap - 12) * 0.025)
+            scores[outcome] = base_blend * overdue_tie_boost
         else:
-            t_score += 0.14
-    elif repeats > switches * 1.15:
-        pattern_desc = f"نمط سلاسل نشط (Streak={streak} | {repeats} تكرار مقابل {switches} تبديل)"
-        if last_item == "🐉 تنين":
-            d_score += 0.14
-        else:
-            t_score += 0.14
+            # للنتيجتين الرئيسيتين (تنين / تايجر): لا نعكس النتيجة المدخلة قسرياً!
+            flow_mod = 1.0
+            if last_decisive:
+                if outcome == last_decisive:
+                    # إذا كان السجل يدعم استمرار نفس الاختيار (Streak) أو في الجولات الأولى
+                    if n_dec == 1:
+                        flow_mod = 1.02  # الحفاظ على اتجاه النتيجة المدخلة وعدم عكسها
+                    elif repeat_ratio >= 0.50 or cur_streak >= 2:
+                        flow_mod = 1.0 + min(0.18, (repeat_ratio - 0.45) * 0.45 + (cur_streak * 0.02))
+                    else:
+                        flow_mod = 0.94
+                else:
+                    # الخيار المعاكس يرتفع فقط إذا أثبت السجل فعلياً وجود نمط تبادلي واضح (Chop)
+                    if n_dec >= 2 and switch_ratio > 0.58:
+                        flow_mod = 1.0 + min(0.18, (switch_ratio - 0.50) * 0.45)
+                    else:
+                        flow_mod = 0.98
+            scores[outcome] = base_blend * flow_mod
+
+    total_s = sum(scores.values()) or 1.0
+    prob_map = {k: (v / total_s) * 100.0 for k, v in scores.items()}
+
+    # تحديد التوقع المستقبلي: التعادل لا يتصدر التوقع الرئيسي إلا إذا تجاوزت أدلته عتبة صارمة، وإلا يظل مؤشراً ثانوياً نادراً
+    if prob_map["🤝 تعادل"] >= 22.0 and prob_map["🤝 تعادل"] > max(prob_map["🐉 تنين"], prob_map["🐅 تايجر"]):
+        predicted = "🤝 تعادل"
+    elif prob_map["🐉 تنين"] >= prob_map["🐅 تايجر"]:
+        predicted = "🐉 تنين"
     else:
-        pattern_desc = f"توزيع عشوائي متقارب (تبديل={switches}, تكرار={repeats})"
-        if opposite == "🐉 تنين":
-            d_score += 0.04
-        else:
-            t_score += 0.04
+        predicted = "🐅 تايجر"
 
-    total = d_score + t_score
-    d_prob = (d_score / total) * 100.0
-    t_prob = (t_score / total) * 100.0
-
-    if d_prob >= t_prob:
-        return "🐉 تنين", d_prob, pattern_desc
+    if n_dec <= 1:
+        pattern_desc = f"عينة أولية ({n} جولة) — استقرار مع آخر نتيجة مدخلة دون عكس مصطنع"
+    elif repeat_ratio >= 0.55:
+        pattern_desc = f"نمط متسلسل يدعم التكرار (Streak={cur_streak} | تكرار={repeats} مقابل تبديل={switches})"
+    elif switch_ratio >= 0.58:
+        pattern_desc = f"نمط تبادلي (Chop: تبديل={switches} مقابل تكرار={repeats})"
     else:
-        return "🐅 تايجر", t_prob, pattern_desc
+        pattern_desc = f"توزيع متوازن بين التنين والتايجر (تكرار={repeats}, تبديل={switches})"
+
+    tie_note = (
+        f"احتمال التعادل النادر: {prob_map['🤝 تعادل']:.1f}% (غائب منذ {tie_gap} جولة)"
+        if prob_map["🤝 تعادل"] < 14.0
+        else f"⚠️ مؤشر التعادل النادر مرتفع نسبياً: {prob_map['🤝 تعادل']:.1f}% (غائب منذ {tie_gap} جولة)"
+    )
+
+    return predicted, prob_map, pattern_desc, tie_note
 
 
 def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
     norm_hist = []
     for h in clean_hist:
-        if "تنين" in h:
-            norm_hist.append("🐉 تنين")
-        elif "تايجر" in h:
-            norm_hist.append("🐅 تايجر")
-        elif "تعادل" in h:
-            norm_hist.append("🤝 تعادل")
+        sym = _normalize_dt_symbol(h)
+        if sym:
+            norm_hist.append(sym)
 
     n = len(norm_hist)
-    pred_item, est_prob, pattern_desc = _dt_score_next_step(norm_hist)
+    pred_item, prob_map, pattern_desc, tie_note = _dt_score_next_step(norm_hist)
+    est_prob = prob_map.get(pred_item, 46.3)
 
+    # اختبار Walk-Forward صارم بدون تسريب للمستقبل
     hits = 0
     trials = 0
     if n >= 4:
         for t in range(3, n):
-            if norm_hist[t] == "🤝 تعادل":
-                continue
-            step_pred, _, _ = _dt_score_next_step(norm_hist[:t])
+            step_pred, _, _, _ = _dt_score_next_step(norm_hist[:t])
             if step_pred == norm_hist[t]:
                 hits += 1
             trials += 1
@@ -715,30 +833,61 @@ def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
     d_c = norm_hist.count("🐉 تنين")
     t_c = norm_hist.count("🐅 تايجر")
     tie_c = norm_hist.count("🤝 تعادل")
-    last_seen = norm_hist[-1] if n > 0 else "لا يوجد"
+    last_recorded = norm_hist[-1] if n > 0 else "لا يوجد"
+    is_repeat_pred = (n > 0 and pred_item == last_recorded)
+    rel_label = "توقع تكرار نفس النتيجة السابقة" if is_repeat_pred else "توقع انتقال لنتيجة أخرى"
 
     if n < min_sample:
-        info_line = f"⚠️ [البيانات غير كافية لجزم علاقة تنبؤية]: مسجل {n}/{min_sample} جولات (المرجع النظري: 46.3%)."
+        info_line = (
+            f"⚠️ [البيانات غير كافية لجزم علاقة تنبؤية]: مسجل {n}/{min_sample} جولات "
+            f"(المرجع النظري: تنين 46.3% | تايجر 46.3% | تعادل 7.4%)."
+        )
         conf_str = f"عينة أولية ({n} جولات)"
     else:
         info_line = (
-            f"📊 [اختبار Walk-Forward على {trials} جولة حسم]: "
-            f"الدقة المحققة {measured_acc:.1f}% (المرجع 46.3%) | السجل: تنين({d_c}) تايجر({t_c}) تعادل({tie_c}) | آخر نتيجة: {last_seen}"
+            f"📊 [اختبار Walk-Forward على {trials} جولة]: "
+            f"الدقة المحققة {measured_acc:.1f}% (المرجع 46.3%) | السجل: تنين({d_c}) تايجر({t_c}) تعادل({tie_c})"
         )
         conf_str = f"اختبار فعلي: {measured_acc:.1f}% (عينة: {n})"
 
     pred_html = (
-        f"⚡ التقدير المستقل للجولة التالية: {pred_item} (وزن نسبي: {est_prob:.1f}%)<br>"
+        f"<div style='margin-bottom:4px;font-size:10px;color:#cbd5e1;'>"
+        f"📌 <strong>آخر نتيجة مدخلة في السجل (جولة #{n}):</strong> <span style='color:#fbbf24;'>{last_recorded}</span> "
+        f"| <strong>توزيع الأوزان:</strong> تنين {prob_map['🐉 تنين']:.1f}% | تايجر {prob_map['🐅 تايجر']:.1f}% | تعادل {prob_map['🤝 تعادل']:.1f}%"
+        f"</div>"
+        f"<div style='background:#052e16;border:1px solid #10b981;padding:5px;border-radius:5px;margin-bottom:4px;'>"
+        f"⚡ <strong>التقدير المستقبلي المستقل للجولة القادمة (#{n+1}):</strong> {pred_item} — وزن: <strong>{est_prob:.1f}%</strong> ({rel_label})<br>"
+        f"<span style='font-size:9px;color:#6ee7b7;'>🤝 [تحليل التعادل النادر]: {tie_note}</span>"
+        f"</div>"
         f"<span style='font-size:9px;color:#cbd5e1;'>[تشخيص السجل: {pattern_desc}]</span><br>"
         f"<span style='font-size:9px;color:#93c5fd;'>{info_line}</span>"
     )
-    log_msg = f"[DT-ENGINE] N={n} | Hit={hits}/{trials} ({measured_acc:.1f}%) | Mode={pattern_desc[:18]}"
+
+    log_msg = (
+        f"[DT-ENGINE] N={n} | LastIn={last_recorded} | NextPred={pred_item}({est_prob:.1f}%) | "
+        f"TieProb={prob_map['🤝 تعادل']:.1f}% | Hit={hits}/{trials}"
+    )
+
     return {
         "prediction_html": pred_html,
         "confidence": conf_str,
         "engine_log": log_msg,
         "measured_accuracy": round(measured_acc, 1) if trials > 0 else None,
         "baseline_accuracy": 46.3,
+        "dt_details": {
+            "last_recorded": last_recorded,
+            "predicted_next": pred_item,
+            "is_repeat_prediction": is_repeat_pred,
+            "probabilities": {
+                "dragon": round(prob_map["🐉 تنين"], 1),
+                "tiger": round(prob_map["🐅 تايجر"], 1),
+                "tie": round(prob_map["🤝 تعادل"], 1),
+            },
+            "counts": {"dragon": d_c, "tiger": t_c, "tie": tie_c},
+            "pattern_desc": pattern_desc,
+            "tie_note": tie_note,
+            "sample_size": n,
+        },
     }
 
 
@@ -754,23 +903,61 @@ def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
 
 
 # =====================================================================
-# 5. نقاط النهاية (API Endpoints)
+# 5. نقاط النهاية (API Endpoints) شاملة الأمان وإحصائيات لوحة التحكم
 # =====================================================================
 
 @app.post("/api/admin/login")
-def admin_login_endpoint(req: AdminLoginRequest):
+def admin_login_endpoint(req: AdminLoginRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, wait_secs = lifecycle.check_admin_rate_limit(client_ip)
+
+    if not allowed:
+        lifecycle.record_audit_event("ADMIN_LOCKOUT", f"Blocked login from {client_ip} ({wait_secs}s left)", "WARNING")
+        raise HTTPException(
+            status_code=429,
+            detail=f"تم تجاوز الحد المسموح لمحاولات الدخول. يرجى الانتظار {wait_secs} ثانية.",
+        )
+
+    if req.trigger_clicks is not None and req.trigger_clicks < 6:
+        lifecycle.record_audit_event("ADMIN_TRIGGER_REJECT", f"Insufficient clicks ({req.trigger_clicks}/6) from {client_ip}", "WARNING")
+        raise HTTPException(status_code=403, detail="يجب إكمال 6 ضغطات متتالية لفتح بوابة التصريح.")
+
     clean_pass = req.password.strip()
     if clean_pass == ADMIN_SECRET:
+        admin_token = lifecycle.create_admin_session(client_ip)
         status_code, _ = supabase_server_request("licenses?select=key_code&limit=1", "GET")
         db_connected = status_code == 200
+        lifecycle.record_audit_event("ADMIN_LOGIN_SUCCESS", f"Admin authenticated from {client_ip}", "INFO")
         return {
             "ok": True,
             "authenticated": True,
+            "admin_token": admin_token,
             "db_connected": db_connected,
             "message": "تم التحقق من صلاحيات الأدمن بنجاح.",
         }
-    logger.warning("Failed admin login attempt.")
+
+    lifecycle.register_admin_failure(client_ip)
+    lifecycle.record_audit_event("ADMIN_LOGIN_FAILED", f"Invalid password attempt from {client_ip}", "ERROR")
+    logger.warning(f"Failed admin login attempt from {client_ip}.")
     raise HTTPException(status_code=401, detail="كلمة المرور غير صحيحة.")
+
+
+@app.get("/api/admin/telemetry")
+def admin_telemetry_endpoint(x_admin_token: Optional[str] = Header(default=None)):
+    """إرجاع إحصائيات السيرفر الحقيقية وسجل الأنشطة والأخطاء للرسوم البيانية في لوحة التحكم"""
+    state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
+    token_valid = lifecycle.verify_admin_token(x_admin_token)
+    room_summary = {k: len(v) for k, v in lifecycle.room_histories.items()}
+
+    return {
+        "ok": True,
+        "token_verified": token_valid,
+        "lifecycle": state,
+        "game_request_counts": lifecycle.game_request_counts,
+        "room_round_counts": room_summary,
+        "audit_logs": lifecycle.audit_logs[-25:][::-1],
+        "error_logs": lifecycle.error_logs[-15:][::-1],
+    }
 
 
 @app.post("/api/license/verify")
@@ -783,6 +970,7 @@ def verify_license_proxy(req: LicenseVerifyRequest):
     )
 
     if status_code != 200 or not isinstance(rows, list):
+        lifecycle.record_error_event("SUPABASE_VERIFY", f"Status {status_code} on key {clean_code}")
         return {
             "ok": False,
             "error_type": "DB_QUERY_ERROR",
@@ -837,6 +1025,7 @@ def verify_license_proxy(req: LicenseVerifyRequest):
             {"bound_device": req.device_token},
         )
 
+    lifecycle.record_audit_event("LICENSE_VERIFIED", f"Key {clean_code} verified on device {req.device_token[:10]}")
     return {
         "ok": True,
         "error_type": None,
@@ -853,7 +1042,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.3",
+        "version": "120.4",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -908,9 +1097,13 @@ async def predict_endpoint(req: PredictionRequest):
         try:
             min_s = lifecycle.config.min_sample_for_pattern
             poker_details = None
+            dt_details = None
+
             if "FARM" in game:
+                lifecycle.game_request_counts["FARM"] = lifecycle.game_request_counts.get("FARM", 0) + 1
                 res = run_farm_engine(clean_hist, min_s)
             elif "POKER" in game:
+                lifecycle.game_request_counts["POKER"] = lifecycle.game_request_counts.get("POKER", 0) + 1
                 res = run_poker_engine(
                     clean_hist,
                     min_s,
@@ -920,7 +1113,9 @@ async def predict_endpoint(req: PredictionRequest):
                 )
                 poker_details = res.get("poker_details")
             elif "DRAGON" in game:
+                lifecycle.game_request_counts["DRAGON"] = lifecycle.game_request_counts.get("DRAGON", 0) + 1
                 res = run_dragon_tiger_engine(clean_hist, min_s)
+                dt_details = res.get("dt_details")
             else:
                 raise HTTPException(status_code=400, detail="نوع اللعبة غير مدعوم.")
 
@@ -960,6 +1155,7 @@ async def predict_endpoint(req: PredictionRequest):
                 "measured_accuracy": res["measured_accuracy"],
                 "baseline_accuracy": res["baseline_accuracy"],
                 "poker_details": poker_details,
+                "dt_details": dt_details,
                 "deduplicated": False,
             }
 
@@ -970,7 +1166,7 @@ async def predict_endpoint(req: PredictionRequest):
             return response_payload
 
         except Exception as exc:
-            lifecycle.error_count += 1
+            lifecycle.record_error_event(f"PREDICT_{game}", str(exc))
             logger.exception(f"Prediction error in {game}: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
         finally:
@@ -980,8 +1176,15 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.3 Online",
-        "endpoints": ["/api/predict", "/api/health", "/api/config", "/api/admin/login", "/api/license/verify"],
+        "status": "Phantom Statistical & Lifecycle Server v120.4 Online",
+        "endpoints": [
+            "/api/predict",
+            "/api/health",
+            "/api/config",
+            "/api/admin/login",
+            "/api/admin/telemetry",
+            "/api/license/verify",
+        ],
     }
 
 
