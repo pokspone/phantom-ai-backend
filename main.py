@@ -1,13 +1,27 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Tuple
-from collections import Counter, defaultdict
-from datetime import datetime, timezone, timedelta
+import asyncio
+import hashlib
+import json
+import logging
+import math
 import os
 import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# إعداد نظام تسجيل الأخطاء والأحداث
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("PhantomStatisticalServer")
+
+app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,223 +31,397 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# تسجيل وقت بدء تشغيل السيرفر لحساب دورة الـ 7 ساعات
-SERVER_START_TIME = time.time()
+STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.json")
+
+
+# =====================================================================
+# 1. نماذج البيانات والإعدادات القابلة للتعديل
+# =====================================================================
+
+class RuntimeConfig(BaseModel):
+    review_cycle_hours: float = Field(default=7.0, ge=0.5, le=72.0)
+    idle_timeout_seconds: int = Field(default=600, ge=60, le=7200)
+    low_load_rest_minutes: int = Field(default=15, ge=1, le=180)
+    max_concurrent_tasks: int = Field(default=12, ge=1, le=100)
+    high_load_threshold_rpm: int = Field(default=45, ge=5, le=1000)
+    min_sample_for_pattern: int = Field(default=6, ge=3, le=50)
+    dedup_window_seconds: int = Field(default=2, ge=0, le=30)
+
 
 class PredictionRequest(BaseModel):
     game_type: str
-    room_id: Optional[str] = None
+    room_id: Optional[str] = "default"
     history: List[str] = []
     coins: int = 0
     client_hour: Optional[int] = None
     client_minute: Optional[int] = None
+    force_refresh: Optional[bool] = False
 
-# بيانات وأوزان عجلة المزرعة والدورة المتوقعة لكل عنصر (كم جولة في المتوسط ليظهر)
-FARM_ITEMS_META: Dict[str, Dict] = {
-    "🍅 طماطم (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
-    "🌽 ذرة (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
-    "🥬 خس (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
-    "🥕 جزر (×5)": {"mult": 5, "base_weight": 19.0, "expected_gap": 5.2, "tier": "common"},
-    "🌭 سجق (×10)": {"mult": 10, "base_weight": 9.5, "expected_gap": 10.5, "tier": "medium"},
-    "🍢 شيش (×15)": {"mult": 15, "base_weight": 6.0, "expected_gap": 16.0, "tier": "medium"},
-    "🍗 فراخ (×25)": {"mult": 25, "base_weight": 3.8, "expected_gap": 25.0, "tier": "high"},
-    "🥩 لحمة (×45)": {"mult": 45, "base_weight": 2.1, "expected_gap": 42.0, "tier": "high"},
-    "🥗 سلطة (نادر 🌟)": {"mult": 50, "base_weight": 1.3, "expected_gap": 65.0, "tier": "rare"},
-    "🍕 بيتزا (نادر 🌟)": {"mult": 50, "base_weight": 1.3, "expected_gap": 65.0, "tier": "rare"},
+
+# =====================================================================
+# 2. مدير التشغيل والموارد ودورة الـ 7 ساعات (Lifecycle & Load Manager)
+# =====================================================================
+
+class ServerLifecycleManager:
+    def __init__(self, state_file: str):
+        self.state_file = state_file
+        self.config = RuntimeConfig()
+        self.start_time = time.time()
+        self.last_checkpoint_time = time.time()
+        self.last_request_time = time.time()
+        self.operational_mode = "ACTIVE"  # ACTIVE | LOW_POWER_REST | HIGH_LOAD_THROTTLED | MAINTENANCE_CHECKPOINT
+        self.total_requests = 0
+        self.error_count = 0
+        self.checkpoints_completed = 0
+        self.active_tasks = 0
+        self.recent_request_timestamps: List[float] = []
+        self.dedup_cache: Dict[str, Tuple[float, Dict]] = {}
+        self.room_histories: Dict[str, List[str]] = {}
+        self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
+        self.load_persisted_state()
+
+    def load_persisted_state(self):
+        """استرجاع حالة العمل والبيانات المحفوظة عند بدء التشغيل لمنع فقدان السجل"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.total_requests = data.get("total_requests", 0)
+                self.checkpoints_completed = data.get("checkpoints_completed", 0)
+                self.room_histories = data.get("room_histories", {})
+                saved_cfg = data.get("config")
+                if saved_cfg:
+                    self.config = RuntimeConfig(**saved_cfg)
+                    self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
+                logger.info("Persisted state loaded successfully.")
+            except Exception as exc:
+                logger.error(f"Failed to load state file: {exc}")
+
+    def save_persisted_state(self):
+        """حفظ حالة العمل والبيانات قبل أي نقطة مراجعة أو راحة"""
+        try:
+            payload = {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "uptime_seconds": round(time.time() - self.start_time, 2),
+                "total_requests": self.total_requests,
+                "error_count": self.error_count,
+                "checkpoints_completed": self.checkpoints_completed,
+                "config": self.config.dict(),
+                "room_histories": self.room_histories,
+            }
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.error(f"State persistence error: {exc}")
+
+    def update_config(self, new_cfg: RuntimeConfig):
+        self.config = new_cfg
+        self.semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
+        self.save_persisted_state()
+
+    def get_requests_per_minute(self) -> int:
+        now = time.time()
+        self.recent_request_timestamps = [t for t in self.recent_request_timestamps if now - t <= 60.0]
+        return len(self.recent_request_timestamps)
+
+    def evaluate_lifecycle_state(self, is_incoming_prediction: bool = False) -> Dict:
+        now = time.time()
+        rpm = self.get_requests_per_minute()
+        hours_since_checkpoint = (now - self.last_checkpoint_time) / 3600.0
+        idle_seconds = now - self.last_request_time
+
+        # 1. فحص نقطة المراجعة الدورية (كل 7 ساعات افتراضياً) دون إعادة تشغيل قسرية
+        if hours_since_checkpoint >= self.config.review_cycle_hours:
+            self.operational_mode = "MAINTENANCE_CHECKPOINT"
+            self.save_persisted_state()
+            # تنظيف الذاكرة المؤقتة القديمة مع الحفاظ على سجلات الغرف
+            self.dedup_cache = {
+                k: v for k, v in self.dedup_cache.items() if now - v[0] <= self.config.dedup_window_seconds
+            }
+            self.last_checkpoint_time = now
+            self.checkpoints_completed += 1
+            logger.info(f"7-Hour Checkpoint #{self.checkpoints_completed} completed without data loss.")
+
+        # 2. الاستئناف التلقائي فور وصول طلب جديد إذا كان في وضع الراحة
+        if is_incoming_prediction:
+            self.last_request_time = now
+            self.recent_request_timestamps.append(now)
+            rpm = self.get_requests_per_minute()
+            if rpm >= self.config.high_load_threshold_rpm:
+                self.operational_mode = "HIGH_LOAD_THROTTLED"
+            else:
+                self.operational_mode = "ACTIVE"
+        else:
+            # في حال عدم وجود طلبات لفترة طويلة ينتقل السيرفر تلقائياً لوضع الراحة وتوفير الموارد
+            if idle_seconds >= self.config.idle_timeout_seconds:
+                if self.operational_mode != "LOW_POWER_REST":
+                    self.operational_mode = "LOW_POWER_REST"
+                    self.save_persisted_state()
+            elif rpm >= self.config.high_load_threshold_rpm:
+                self.operational_mode = "HIGH_LOAD_THROTTLED"
+            else:
+                self.operational_mode = "ACTIVE"
+
+        next_checkpoint_in_hours = max(
+            0.0, self.config.review_cycle_hours - ((now - self.last_checkpoint_time) / 3600.0)
+        )
+
+        mode_Arabic = {
+            "ACTIVE": "🟢 السيرفر نشط (تشغيل قياسي)",
+            "LOW_POWER_REST": "🟠 وضع توفير الموارد (يستأنف تلقائياً عند الطلب)",
+            "HIGH_LOAD_THROTTLED": "🟡 ضغط مرتفع (تنظيم المهام المتزامنة نشط)",
+            "MAINTENANCE_CHECKPOINT": "🔵 نقطة مراجعة الـ 7 ساعات (حفظ البيانات مكتمل)",
+        }.get(self.operational_mode, "🟢 نشط")
+
+        return {
+            "mode": self.operational_mode,
+            "mode_label": mode_Arabic,
+            "rpm": rpm,
+            "active_tasks": self.active_tasks,
+            "max_concurrent_tasks": self.config.max_concurrent_tasks,
+            "uptime_hours": round((now - self.start_time) / 3600.0, 2),
+            "next_checkpoint_hours": round(next_checkpoint_in_hours, 2),
+            "checkpoints_completed": self.checkpoints_completed,
+            "total_requests": self.total_requests,
+            "error_count": self.error_count,
+        }
+
+
+lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
+
+
+# =====================================================================
+# 3. المحركات الإحصائية المنفصلة للألعاب الثلاث (بدون تسريب للمستقبل)
+# =====================================================================
+
+FARM_CATALOG: Dict[str, Dict] = {
+    "🍅 طماطم (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
+    "🌽 ذرة (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
+    "🥬 خس (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
+    "🥕 جزر (×5)": {"mult": 5, "prior_prob": 0.19, "expected_gap": 5.26, "group": "x5"},
+    "🌭 سجق (×10)": {"mult": 10, "prior_prob": 0.095, "expected_gap": 10.52, "group": "mid"},
+    "🍢 شيش (×15)": {"mult": 15, "prior_prob": 0.060, "expected_gap": 16.67, "group": "mid"},
+    "🍗 فراخ (×25)": {"mult": 25, "prior_prob": 0.038, "expected_gap": 26.31, "group": "high"},
+    "🥩 لحمة (×45)": {"mult": 45, "prior_prob": 0.021, "expected_gap": 47.62, "group": "high"},
+    "🥗 سلطة (نادر 🌟)": {"mult": 50, "prior_prob": 0.013, "expected_gap": 76.92, "group": "rare"},
+    "🍕 بيتزا (نادر 🌟)": {"mult": 50, "prior_prob": 0.013, "expected_gap": 76.92, "group": "rare"},
 }
 
-def clean_history_item(raw_item: str) -> str:
-    return raw_item.split(" [")[0].strip()
 
-def check_server_cycle_and_time(client_hour: Optional[int], client_minute: Optional[int], history_len: int) -> Dict:
+def normalize_item_name(raw: str) -> str:
+    return raw.split(" [")[0].strip()
+
+
+def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
     """
-    إدارة دورة عمل السيرفر (يعمل 7 ساعات ويرتاح تلقائياً، أو يرتاح في أوقات الضغط الشديد في تطبيقات الدردشة)
+    حساب التوزيع الاحتمالي للجولة التالية لعجلة المزرعة بالاعتماد فقط على السجل المتاح حتى اللحظة t:
+    - يدمج مصفوفة الانتقال الشرطي من الدرجة الأولى والثانية (Markov Order-1 & Order-2).
+    - يدمج ضغط التأخر عن الدورة الطبيعية (Overdue Gap Ratio) لكسر ثبات عناصر ×5.
+    - يطبق عقوبة عدم نسخ آخر نتيجة مباشرة ما لم يكن معدل التكرار في السجل مرتفعاً فعلياً.
     """
-    if client_hour is not None and client_minute is not None:
-        h, m = client_hour, client_minute
-    else:
-        cairo_now = datetime.now(timezone(timedelta(hours=2)))
-        h, m = cairo_now.hour, cairo_now.minute
+    n = len(history_slice)
+    all_items = list(FARM_CATALOG.keys())
+    if n == 0:
+        return {k: v["prior_prob"] * 100.0 for k, v in FARM_CATALOG.items()}
 
-    time_dec = h + (m / 60.0)
-    time_str = f"{h:02d}:{m:02d}"
+    counts = Counter(history_slice)
+    last_1 = history_slice[-1]
+    last_2 = tuple(history_slice[-2:]) if n >= 2 else None
 
-    # حساب دورة الـ 7 ساعات (كل 7 ساعات عمل هناك 25 دقيقة تبريد وإعادة معايرة)
-    elapsed_hours = (time.time() - SERVER_START_TIME) / 3600.0
-    cycle_position = elapsed_hours % 7.5  # 7 ساعات عمل + نصف ساعة راحة
-    in_7h_cooldown = cycle_position >= 7.0
-    remaining_cooldown_mins = max(1, int((7.5 - cycle_position) * 60)) if in_7h_cooldown else 0
+    # انتقالات الدرجة الأولى: ماذا جاء بعد last_1؟
+    trans_1 = Counter()
+    total_trans_1 = 0
+    for i in range(n - 1):
+        if history_slice[i] == last_1:
+            trans_1[history_slice[i + 1]] += 1
+            total_trans_1 += 1
 
-    # فحص أوقات تطبيقات الدردشة (HiFami)
-    # 1. أوقات سيئة جداً (سحب وتذبذب عنيف): 22:30 إلى 23:45 (حسم الـ PK الليلي) و 07:30 إلى 08:30 صباحاً
-    if (22.5 <= time_dec < 23.75) or (7.5 <= time_dec < 8.5) or (20.5 <= time_dec < 21.0):
-        return {
-            "is_resting": True,
-            "status_code": "SERVER_REST_BAD_TIME",
-            "mood_badge": "🔴 السيرفر في استراحة (وقت خطر)",
-            "banner": f"🛑 [استراحة السيرفر التلقائية - {time_str}]: الألعاب في هاي فامي حالياً في وقت ضغط/شفط عالٍ. السيرفر متوقف مؤقتاً لحماية كوينزاتك!",
-            "risk_mult": 0.15,
-            "rare_boost": 0.6
-        }
+    # انتقالات الدرجة الثانية: ماذا جاء بعد (history[-2], history[-1])؟
+    trans_2 = Counter()
+    total_trans_2 = 0
+    if last_2 and n >= 3:
+        for i in range(n - 2):
+            if (history_slice[i], history_slice[i + 1]) == last_2:
+                trans_2[history_slice[i + 2]] += 1
+                total_trans_2 += 1
 
-    # 2. راحة دورة الـ 7 ساعات التلقائية
-    if in_7h_cooldown:
-        return {
-            "is_resting": True,
-            "status_code": "SERVER_7H_COOLDOWN",
-            "mood_badge": f"🟠 راحة تلقائية ({remaining_cooldown_mins}د)",
-            "banner": f"⏳ [تبريد السيرفر كل 7 ساعات]: السيرفر يأخذ راحة تلقائية لمدة {remaining_cooldown_mins} دقيقة لإعادة ضبط الخوارزمية وتفريغ الضغط.",
-            "risk_mult": 0.25,
-            "rare_boost": 0.8
-        }
+    # معدل التكرار المتتالي الفعلي في السجل
+    consecutive_repeats = sum(1 for i in range(1, n) if history_slice[i] == history_slice[i - 1])
+    observed_repeat_rate = (consecutive_repeats / (n - 1)) if n > 1 else 0.15
 
-    # 3. الأوقات الذهبية النشطة (12ص-7ص | 12ظ-4ع | 8م-8:30م | 9م-10م)
-    if (0.0 <= time_dec < 7.0) or (12.0 <= time_dec < 16.0) or (20.0 <= time_dec < 20.5) or (21.0 <= time_dec < 22.0):
-        window_name = "الليل الذهبي (12ص-7ص)" if time_dec < 7.0 else (
-            "الظهر للعصر (12ظ-4ع)" if time_dec < 16.0 else (
-                "نافذة المساء (8م-8:30م)" if time_dec < 20.5 else "ساعة الـ PK الذهبية (9م-10م)"
-            )
-        )
-        return {
-            "is_resting": False,
-            "status_code": "ACTIVE_GOLDEN",
-            "mood_badge": "🟢 السيرفر نشط (وقت ذهبي)",
-            "banner": f"🟢 [السيرفر نشط بكامل طاقته - {time_str}]: أنت الآن في ({window_name}) — أفضل وقت لتوقع الجولات القادمة!",
-            "risk_mult": 1.0,
-            "rare_boost": 1.25
-        }
+    raw_scores: Dict[str, float] = {}
+    for item, meta in FARM_CATALOG.items():
+        prior = meta["prior_prob"]
+        obs_freq = counts.get(item, 0) / n
 
-    # 4. الأوقات العادية المتوسطة
-    return {
-        "is_resting": False,
-        "status_code": "ACTIVE_NORMAL",
-        "mood_badge": "🟢 السيرفر نشط (مستقر)",
-        "banner": f"⚡ [السيرفر نشط - {time_str}]: حالة اللعب متوسطة ومستقرة. الدورة القادمة للراحة بعد {max(1, int(7.0 - cycle_position))} ساعات.",
-        "risk_mult": 0.7,
-        "rare_boost": 1.0
+        # 1. تقدير بايزي مرن للتكرار العام
+        alpha = 4.0
+        empirical_bayes = (counts.get(item, 0) + alpha * prior) / (n + alpha)
+
+        # 2. احتمال الانتقال الشرطي للجولة القادمة
+        p_t1 = (trans_1[item] + 1.5 * prior) / (total_trans_1 + 1.5) if total_trans_1 > 0 else empirical_bayes
+        p_t2 = (trans_2[item] + 1.0 * prior) / (total_trans_2 + 1.0) if total_trans_2 > 0 else p_t1
+
+        # 3. حساب فجوة الغياب (كم جولة مرت منذ آخر ظهور لهذا العنصر؟)
+        if item in history_slice:
+            last_pos = len(history_slice) - 1 - history_slice[::-1].index(item)
+            gap = (n - 1) - last_pos
+        else:
+            gap = n + 1
+
+        overdue_ratio = gap / meta["expected_gap"]
+        # منحنى ضغط الغياب: يرفع وزن العناصر التي تأخرت عن دورتها لمنع جمود التوقعات
+        overdue_multiplier = 1.0 + min(1.40, math.pow(overdue_ratio, 1.15) * 0.48)
+
+        # 4. تصحيح التشبع في آخر 6 جولات (منع احتكار عنصر واحد للتوقعات)
+        recent_window = history_slice[-6:]
+        recent_share = recent_window.count(item) / len(recent_window)
+        saturation_factor = 0.62 if recent_share > (prior * 2.1) else 1.08
+
+        # 5. منع نسخ آخر نتيجة تلقائياً إلا إذا كان السجل يظهر موجة تكرار حقيقية
+        if item == last_1:
+            anti_copy_factor = 0.92 if observed_repeat_rate >= 0.30 else 0.48
+        else:
+            anti_copy_factor = 1.12
+
+        combined = (0.30 * empirical_bayes + 0.42 * p_t1 + 0.28 * p_t2)
+        raw_scores[item] = combined * overdue_multiplier * saturation_factor * anti_copy_factor
+
+    total = sum(raw_scores.values()) or 1.0
+    return {k: (v / total) * 100.0 for k, v in raw_scores.items()}
+
+
+def _select_farm_top5(prob_map: Dict[str, float]) -> List[Tuple[str, float]]:
+    """
+    اختيار أقوى 5 عناصر لعجلة المزرعة مع ضمان عدم احتكار فئة ×5 لجميع المراكز
+    عندما ترتفع مؤشرات المضاعفات المتوسطة أو العالية.
+    """
+    x5_items = [k for k, v in FARM_CATALOG.items() if v["group"] == "x5"]
+    mult_items = [k for k, v in FARM_CATALOG.items() if v["group"] != "x5"]
+
+    best_x5 = sorted(x5_items, key=lambda k: prob_map[k], reverse=True)[:3]
+    best_mult = sorted(mult_items, key=lambda k: prob_map[k], reverse=True)[:2]
+
+    selected_keys = best_x5 + best_mult
+    selected_sorted = sorted(selected_keys, key=lambda k: prob_map[k], reverse=True)
+    return [(k, prob_map[k]) for k in selected_sorted]
+
+
+def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict:
+    n = len(clean_hist)
+    prob_map = _farm_score_next_step(clean_hist)
+    top5 = _select_farm_top5(prob_map)
+    top5_coverage = sum(p for _, p in top5)
+
+    # اختبار تاريخي صارم بدون تسريب للمستقبل (Walk-Forward Backtest)
+    backtest_hits = 0
+    backtest_trials = 0
+    baseline_hits = 0
+    default_baseline_set = {
+        "🍅 طماطم (×5)", "🌽 ذرة (×5)", "🥬 خس (×5)", "🥕 جزر (×5)", "🌭 سجق (×10)"
     }
 
-def check_streak_warning(clean_hist: List[str]) -> Tuple[bool, str]:
-    if len(clean_hist) >= 5:
-        last_five = clean_hist[-5:]
-        if all(x == last_five[0] for x in last_five):
-            return True, (
-                f"⚠️ [تحذير تذبذب حاد]: النتيجة ({last_five[0]}) تكررت 5 جولات متتالية! "
-                f"السيرفر ينصح بالتوقف لجولة واحدة حتى تستقر الدورة."
-            )
-    return False, ""
+    if n >= 4:
+        for t in range(3, n):
+            past_only = clean_hist[:t]  # لا يتضمن clean_hist[t] إطلاقاً
+            step_probs = _farm_score_next_step(past_only)
+            step_top5 = {k for k, _ in _select_farm_top5(step_probs)}
+            actual_next = clean_hist[t]
+            if actual_next in step_top5:
+                backtest_hits += 1
+            if actual_next in default_baseline_set:
+                baseline_hits += 1
+            backtest_trials += 1
 
-def predict_next_farm_round(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
-    """
-    يتوقع الجولة القادمة في المزرعة بناءً على:
-    1. مصفوفة الانتقال (ماذا يأتي عادةً بعد العنصر الأخير والعنصرين الأخيرين؟).
-    2. ضغط الغياب (Overdue Pressure): العناصر التي غابت أكثر من دورتها الطبيعية يرتفع احتمال قدومها في الجولة القادمة.
-    3. منع نسخ العنصر الأخير تلقائياً إلا إذا كان نمط السيرفر يكرر.
-    """
-    n = len(clean_hist)
-    rare_boost = cycle_meta.get("rare_boost", 1.0)
-    all_items = list(FARM_ITEMS_META.keys())
+    hit_rate = (backtest_hits / backtest_trials * 100.0) if backtest_trials > 0 else 0.0
+    base_rate = (baseline_hits / backtest_trials * 100.0) if backtest_trials > 0 else 0.0
 
-    if n == 0:
-        # توقع افتتاحي متوازن يجمع 3 خضروات + 2 مضاعفات متوسطة
-        default_top5 = [
-            "1️⃣ 🍅 طماطم (×5) — توقع افتتاحي 21.5%",
-            "2️⃣ 🌽 ذرة (×5) — توقع افتتاحي 20.8%",
-            "3️⃣ 🥬 خس (×5) — توقع افتتاحي 19.4%",
-            "4️⃣ 🌭 سجق (×10) — تغطية مضاعف 12.6%",
-            "5️⃣ 🍢 شيش (×15) — صيد مضاعف 8.5%",
-            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
-        ]
-        return "<br>".join(default_top5), "82.8% (افتتاحي)", "[FARM-NEXT] Waiting for history to build transition matrix"
-
-    last_item = clean_hist[-1]
-    counts = Counter(clean_hist)
-
-    # 1. حساب مصفوفة الانتقال للجولة القادمة (ماذا جاء بعد last_item في الجولات السابقة؟)
-    next_after_last = Counter()
-    total_after_last = 0
-    for i in range(n - 1):
-        if clean_hist[i] == last_item:
-            next_after_last[clean_hist[i + 1]] += 1
-            total_after_last += 1
-
-    # حساب هل السيرفر في حالة تكرار مباشر أم تغيير؟
-    repeat_rate = 0.0
-    if n >= 2:
-        repeats = sum(1 for i in range(1, n) if clean_hist[i] == clean_hist[i - 1])
-        repeat_rate = repeats / (n - 1)
-
-    scores: Dict[str, float] = {}
-    for item, meta in FARM_ITEMS_META.items():
-        base_w = (meta["base_weight"] / 100.0) * (rare_boost if meta["tier"] in ("high", "rare") else 1.0)
-
-        # حساب عدد الجولات منذ آخر ظهور لهذا العنصر (Overdue Gap)
-        if item in clean_hist:
-            last_seen_idx = len(clean_hist) - 1 - clean_hist[::-1].index(item)
-            gap = (n - 1) - last_seen_idx
-        else:
-            gap = n + 2  # لم يظهر أبداً في السجل الحالي -> مرشح قوي للظهور القادم
-
-        expected_gap = meta["expected_gap"]
-        # كلما زاد غياب العنصر عن دورته المتوقعة، زاد ترشيحه للجولة القادمة
-        overdue_pressure = 1.0 + min(0.85, (gap / expected_gap) * 0.45)
-
-        # وزن الانتقال الشرطي (Transition Probability)
-        if total_after_last > 0 and next_after_last[item] > 0:
-            trans_boost = 1.0 + ((next_after_last[item] / total_after_last) * 0.75)
-        else:
-            trans_boost = 1.0
-
-        # معالجة العنصر الذي ظهر في الجولة الأخيرة للتو:
-        # لا نريده أن يتصدر دائماً إلا إذا كان السيرفر في موجة تكرار واضحة
-        if item == last_item:
-            if repeat_rate > 0.35:
-                immediate_factor = 0.95  # السيرفر يكرر، نبقيه ضمن المرشحين
-            else:
-                immediate_factor = 0.42  # السيرفر يغير، نخفض العنصر الأخير لنفسح مجالاً للجولة القادمة الحقيقية
-        else:
-            immediate_factor = 1.15
-
-        # إذا استهلك العنصر أكثر من حصته الطبيعية مؤخراً، نخفض وزنه للجولة القادمة (تصحيح التوازن)
-        obs_ratio = (counts.get(item, 0) / n)
-        saturation_penalty = 0.70 if obs_ratio > (base_w * 1.8) else 1.0
-
-        scores[item] = base_w * overdue_pressure * trans_boost * immediate_factor * saturation_penalty
-
-    # ضمان تشكيلة ذكية للخمس خانات: (أفضل 3 من فئة الخضروات ×5 + أفضل 2 من فئة المضاعفات العالية/النادرة)
-    common_items = [k for k in all_items if FARM_ITEMS_META[k]["tier"] == "common"]
-    special_items = [k for k in all_items if FARM_ITEMS_META[k]["tier"] != "common"]
-
-    total_score = sum(scores.values()) or 1.0
-    norm_probs = {k: (v / total_score) * 100.0 for k, v in scores.items()}
-
-    top_commons = sorted(common_items, key=lambda k: norm_probs[k], reverse=True)[:3]
-    top_specials = sorted(special_items, key=lambda k: norm_probs[k], reverse=True)[:2]
-
-    combined_selection = top_commons + top_specials
-    final_top5 = sorted(combined_selection, key=lambda k: norm_probs[k], reverse=True)
-
-    rank_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    rank_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     lines = []
-    top5_sum = 0.0
-    for idx, item_name in enumerate(final_top5):
-        p = norm_probs[item_name]
-        top5_sum += p
-        role_tag = "تغطية أساسية" if FARM_ITEMS_META[item_name]["tier"] == "common" else "صيد مضاعف"
-        lines.append(f"{rank_emojis[idx]} {item_name} — ترشيح القادم {p:.1f}% ({role_tag})")
+    for idx, (item_name, p) in enumerate(top5):
+        mult_val = FARM_CATALOG[item_name]["mult"]
+        role = "تغطية (×5)" if mult_val == 5 else f"مضاعف (×{mult_val})"
+        lines.append(f"{rank_icons[idx]} {item_name} — وزن القادم: {p:.1f}% [{role}]")
 
-    lines.append(f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>")
-    conf_str = f"{min(96.5, top5_sum + 12.0):.1f}% (توقع القادم)"
-    log_note = f"[FARM-NEXT-PRED] Sample={n} | Last={last_item[:6]} | RepeatRate={repeat_rate:.2f}"
-    return "<br>".join(lines), conf_str, log_note
+    last_seen_str = clean_hist[-1] if n > 0 else "لا يوجد"
+    if n < min_sample:
+        data_status = (
+            f"⚠️ [البيانات غير كافية لجزم نمط]: مسجل {n}/{min_sample} جولات. "
+            f"التقدير الحالي يعتمد على الأوزان المرجعية وتحليل أولي."
+        )
+        conf_badge = f"عينة أولية ({n} جولات)"
+    else:
+        data_status = (
+            f"📊 [تحليل Walk-Forward على {backtest_trials} جولة اختبار]: "
+            f"نجاح النموذج {hit_rate:.1f}% (مقابل مرجع ثابت {base_rate:.1f}%) | آخر نتيجة: {last_seen_str}"
+        )
+        conf_badge = f"اختبار فعلي: {hit_rate:.1f}% (عينة: {n})"
 
-def predict_next_poker_round(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
-    """
-    يتوقع الكرسي القادم في البوكر (توقع مؤكد + توقع بديل) بناءً على:
-    - ماذا يأتي بعد الكرسي الأخير؟
-    - أي كرسي متأخر في الظهور (Overdue Chair)؟
-    """
+    lines.append(f"<span style='font-size:9px;color:#93c5fd;'>{data_status}</span>")
+    log_msg = f"[FARM-ENGINE] N={n} | Backtest={backtest_hits}/{backtest_trials} ({hit_rate:.1f}%) vs Base({base_rate:.1f}%)"
+
+    return {
+        "prediction_html": "<br>".join(lines),
+        "confidence": conf_badge,
+        "engine_log": log_msg,
+        "measured_accuracy": round(hit_rate, 1) if backtest_trials > 0 else None,
+        "baseline_accuracy": round(base_rate, 1) if backtest_trials > 0 else None,
+        "top_coverage": round(top5_coverage, 1),
+    }
+
+
+def _poker_score_next_step(norm_hist: List[str]) -> Dict[str, float]:
     chairs = ["🟢 كرسي A", "🔵 كرسي B", "🔴 كرسي C"]
+    n = len(norm_hist)
+    if n == 0:
+        return {c: 100.0 / 3.0 for c in chairs}
+
+    counts = Counter(norm_hist)
+    last_1 = norm_hist[-1]
+    last_2 = tuple(norm_hist[-2:]) if n >= 2 else None
+
+    trans_1 = Counter()
+    t1_total = 0
+    for i in range(n - 1):
+        if norm_hist[i] == last_1:
+            trans_1[norm_hist[i + 1]] += 1
+            t1_total += 1
+
+    trans_2 = Counter()
+    t2_total = 0
+    if last_2 and n >= 3:
+        for i in range(n - 2):
+            if (norm_hist[i], norm_hist[i + 1]) == last_2:
+                trans_2[norm_hist[i + 2]] += 1
+                t2_total += 1
+
+    repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
+    rep_rate = (repeats / (n - 1)) if n > 1 else 0.33
+
+    scores = {}
+    for c in chairs:
+        emp = (counts.get(c, 0) + 1.0) / (n + 3.0)
+        p1 = (trans_1[c] + 0.7) / (t1_total + 2.1) if t1_total > 0 else emp
+        p2 = (trans_2[c] + 0.5) / (t2_total + 1.5) if t2_total > 0 else p1
+
+        if c in norm_hist:
+            gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
+        else:
+            gap = n + 1
+
+        overdue_factor = 1.0 + min(0.45, (gap / 3.0) * 0.22)
+        if c == last_1:
+            flow_factor = 1.08 if rep_rate > 0.42 else 0.72
+        else:
+            flow_factor = 1.12 if rep_rate <= 0.42 else 0.92
+
+        scores[c] = (0.25 * emp + 0.45 * p1 + 0.30 * p2) * overdue_factor * flow_factor
+
+    total = sum(scores.values()) or 1.0
+    return {c: (scores[c] / total) * 100.0 for c in chairs}
+
+
+def run_poker_engine(clean_hist: List[str], min_sample: int) -> Dict:
     norm_hist = []
     for h in clean_hist:
         if "A" in h:
@@ -244,74 +432,128 @@ def predict_next_poker_round(clean_hist: List[str], cycle_meta: Dict) -> Tuple[s
             norm_hist.append("🔴 كرسي C")
 
     n = len(norm_hist)
-    if n == 0:
-        return (
-            f"⭐ التوقع المؤكد للجولة القادمة: 🟢 كرسي A (34.0%)<br>"
-            f"🔄 التوقع البديل (تغطية): 🔵 كرسي B (33.0%)<br>"
-            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
-            "67.0% (توقع مقعدين)",
-            "[POKER-NEXT] Sample=0 | Ready"
-        )
-
-    last_chair = norm_hist[-1]
-    counts = Counter(norm_hist)
-
-    # حساب الانتقالات بعد الكرسي الأخير
-    trans_counts = Counter()
-    trans_total = 0
-    for i in range(n - 1):
-        if norm_hist[i] == last_chair:
-            trans_counts[norm_hist[i + 1]] += 1
-            trans_total += 1
-
-    # حساب معدل التكرار مقابل التغيير في الطاولة الحالية
-    repeats = sum(1 for i in range(1, n) if norm_hist[i] == norm_hist[i - 1])
-    repeat_ratio = repeats / (n - 1) if n > 1 else 0.33
-
-    scores = {}
-    for c in chairs:
-        # فجوة الغياب للكرسي
-        if c in norm_hist:
-            gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
-        else:
-            gap = n + 2
-
-        overdue_boost = 1.0 + min(0.65, gap * 0.22)
-        trans_prob = ((trans_counts[c] + 1.0) / (trans_total + 3.0)) if trans_total > 0 else (1.0 / 3.0)
-
-        # إذا كان الكرسي هو نفس الكرسي الأخير، نتحقق مما إذا كانت الطاولة تكرر أم تعكس
-        if c == last_chair:
-            chair_Flow = 1.15 if repeat_ratio >= 0.45 else 0.65
-        else:
-            chair_Flow = 1.20 if repeat_ratio < 0.45 else 0.90
-
-        # توازن الحصص (الكراسي الأقل ظهوراً في آخر 10 جولات لها فرصة ارتداد أعلى)
-        recent_slice = norm_hist[-9:]
-        recent_freq = recent_slice.count(c) / len(recent_slice)
-        balance_factor = 1.25 if recent_freq < 0.25 else (0.80 if recent_freq > 0.50 else 1.0)
-
-        scores[c] = trans_prob * overdue_boost * chair_Flow * balance_factor
-
-    total_s = sum(scores.values()) or 1.0
-    probs = {c: (scores[c] / total_s) * 100.0 for c in chairs}
+    probs = _poker_score_next_step(norm_hist)
     ranked = sorted(probs.items(), key=lambda x: x[1], reverse=True)
-
     main_chair, main_p = ranked[0]
     alt_chair, alt_p = ranked[1]
-    comb_p = main_p + alt_p
+    combined_cov = main_p + alt_p
+
+    # اختبار تاريخي صارم لمقعدين (Primary + Backup) ومقعد واحد
+    hits_dual = 0
+    hits_single = 0
+    trials = 0
+    if n >= 4:
+        for t in range(3, n):
+            sub_probs = _poker_score_next_step(norm_hist[:t])
+            sub_ranked = sorted(sub_probs.items(), key=lambda x: x[1], reverse=True)
+            if norm_hist[t] == sub_ranked[0][0]:
+                hits_single += 1
+            if norm_hist[t] in (sub_ranked[0][0], sub_ranked[1][0]):
+                hits_dual += 1
+            trials += 1
+
+    dual_acc = (hits_dual / trials * 100.0) if trials > 0 else 0.0
+    single_acc = (hits_single / trials * 100.0) if trials > 0 else 0.0
+
+    last_chair_str = norm_hist[-1] if n > 0 else "لا يوجد"
+    if n < min_sample:
+        status_line = f"⚠️ [البيانات غير كافية لجزم نمط]: مسجل {n}/{min_sample} جولات (المرجع النظري لمقعدين: 66.7%)."
+        conf_str = f"عينة أولية ({n} جولات)"
+    else:
+        status_line = (
+            f"📊 [اختبار Walk-Forward على {trials} جولة]: "
+            f"إصابة(أساسي+بديل)={dual_acc:.1f}% | إصابة(أساسي فقط)={single_acc:.1f}% | آخر جولة: {last_chair_str}"
+        )
+        conf_str = f"اختبار فعلي: {dual_acc:.1f}% (عينة: {n})"
 
     pred_html = (
-        f"⭐ التوقع المؤكد للجولة القادمة: {main_chair} ({main_p:.1f}%)<br>"
-        f"🔄 التوقع البديل (تغطية آمنة): {alt_chair} ({alt_p:.1f}%)<br>"
-        f"<span style='font-size:9px;color:#93c5fd;'>[قوة التغطية للجولة القادمة: {comb_p:.1f}% | بناءً على {n} جولات]</span><br>"
-        f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
+        f"⭐ التوقع المستقل للجولة التالية: {main_chair} ({main_p:.1f}%)<br>"
+        f"🔄 التغطية البديلة: {alt_chair} ({alt_p:.1f}%)<br>"
+        f"<span style='font-size:9px;color:#93c5fd;'>{status_line}</span>"
     )
-    return pred_html, f"{comb_p:.1f}% (مؤكد + بديل)", f"[POKER-NEXT] Last={last_chair} -> Main={main_chair}"
+    log_msg = f"[POKER-ENGINE] N={n} | DualHit={hits_dual}/{trials} ({dual_acc:.1f}%) | Baseline=66.7%"
+    return {
+        "prediction_html": pred_html,
+        "confidence": conf_str,
+        "engine_log": log_msg,
+        "measured_accuracy": round(dual_acc, 1) if trials > 0 else None,
+        "baseline_accuracy": 66.7,
+    }
 
-def predict_next_dragon_tiger(clean_hist: List[str], cycle_meta: Dict) -> Tuple[str, str, str]:
-    """
-    يتوقع الجولة القادمة في Dragon & Tiger عبر كشف نمط الطاولة (سلسلة Streak أو تبادل Chop أو نمط 2-1).
-    """
+
+def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, float, str]:
+    non_tie = [x for x in norm_hist if x != "🤝 تعادل"]
+    if not non_tie:
+        return "🐉 تنين", 46.3, "توزيع مرجعي متكافئ (لا توجد بيانات حسم)"
+
+    n_nt = len(non_tie)
+    last_item = non_tie[-1]
+    opposite = "🐅 تايجر" if last_item == "🐉 تنين" else "🐉 تنين"
+
+    # حساب طول السلسلة الحالية
+    streak = 1
+    for i in range(n_nt - 2, -1, -1):
+        if non_tie[i] == last_item:
+            streak += 1
+        else:
+            break
+
+    # حساب مصفوفة الانتقال للأنماط (ماذا حدث سابقاً عندما وصلت السلسلة لهذا الطول أو بعد آخر نتيجتين؟)
+    switches = sum(1 for i in range(1, n_nt) if non_tie[i] != non_tie[i - 1])
+    repeats = sum(1 for i in range(1, n_nt) if non_tie[i] == non_tie[i - 1])
+
+    if n_nt >= 3:
+        last_pair = (non_tie[-2], non_tie[-1])
+        pair_next = Counter()
+        pair_total = 0
+        for i in range(n_nt - 2):
+            if (non_tie[i], non_tie[i + 1]) == last_pair:
+                pair_next[non_tie[i + 2]] += 1
+                pair_total += 1
+    else:
+        pair_next = Counter()
+        pair_total = 0
+
+    d_score = 0.5
+    t_score = 0.5
+
+    if pair_total > 0:
+        p_d = (pair_next["🐉 تنين"] + 0.5) / (pair_total + 1.0)
+        p_t = (pair_next["🐅 تايجر"] + 0.5) / (pair_total + 1.0)
+        d_score = 0.6 * p_d + 0.4 * d_score
+        t_score = 0.6 * p_t + 0.4 * t_score
+
+    # دمج ميل السلسلة مقابل الانعكاس
+    if switches > repeats * 1.15:
+        pattern_desc = f"نمط تبادلي نشط (Chop: {switches} تبديل مقابل {repeats} تكرار)"
+        if opposite == "🐉 تنين":
+            d_score += 0.14
+        else:
+            t_score += 0.14
+    elif repeats > switches * 1.15:
+        pattern_desc = f"نمط سلاسل نشط (Streak={streak} | {repeats} تكرار مقابل {switches} تبديل)"
+        if last_item == "🐉 تنين":
+            d_score += 0.14
+        else:
+            t_score += 0.14
+    else:
+        pattern_desc = f"توزيع عشوائي متقارب (تبديل={switches}, تكرار={repeats})"
+        if opposite == "🐉 تنين":
+            d_score += 0.04
+        else:
+            t_score += 0.04
+
+    total = d_score + t_score
+    d_prob = (d_score / total) * 100.0
+    t_prob = (t_score / total) * 100.0
+
+    if d_prob >= t_prob:
+        return "🐉 تنين", d_prob, pattern_desc
+    else:
+        return "🐅 تايجر", t_prob, pattern_desc
+
+
+def run_dragon_tiger_engine(clean_hist: List[str], min_sample: int) -> Dict:
     norm_hist = []
     for h in clean_hist:
         if "تنين" in h:
@@ -322,131 +564,200 @@ def predict_next_dragon_tiger(clean_hist: List[str], cycle_meta: Dict) -> Tuple[
             norm_hist.append("🤝 تعادل")
 
     n = len(norm_hist)
-    if n == 0:
-        return (
-            f"🐉 التوقع القادم: تنين (Dragon) — 50.0%<br>"
-            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
-            "50.0% (افتتاحي)",
-            "[DT-NEXT] Sample=0"
-        )
+    pred_item, est_prob, pattern_desc = _dt_score_next_step(norm_hist)
 
-    non_tie = [x for x in norm_hist if x != "🤝 تعادل"]
-    if not non_tie:
-        return (
-            f"🐅 التوقع القادم: تايجر (Tiger) — 51.5%<br>"
-            f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>",
-            "51.5%",
-            "[DT-NEXT] Only ties recorded"
-        )
+    # اختبار تاريخي صارم بدون تسريب للمستقبل
+    hits = 0
+    trials = 0
+    if n >= 4:
+        for t in range(3, n):
+            if norm_hist[t] == "🤝 تعادل":
+                continue
+            step_pred, _, _ = _dt_score_next_step(norm_hist[:t])
+            if step_pred == norm_hist[t]:
+                hits += 1
+            trials += 1
 
-    last_item = non_tie[-1]
-    opposite = "🐅 تايجر" if last_item == "🐉 تنين" else "🐉 تنين"
+    measured_acc = (hits / trials * 100.0) if trials > 0 else 0.0
+    d_c = norm_hist.count("🐉 تنين")
+    t_c = norm_hist.count("🐅 تايجر")
+    tie_c = norm_hist.count("🤝 تعادل")
+    last_seen = norm_hist[-1] if n > 0 else "لا يوجد"
 
-    # حساب طول السلسلة الحالية (Current Streak)
-    current_streak = 1
-    for i in range(len(non_tie) - 2, -1, -1):
-        if non_tie[i] == last_item:
-            current_streak += 1
-        else:
-            break
-
-    # حساب عدد مرات التبديل مقابل التكرار
-    switches = sum(1 for i in range(1, len(non_tie)) if non_tie[i] != non_tie[i - 1])
-    repeats = sum(1 for i in range(1, len(non_tie)) if non_tie[i] == non_tie[i - 1])
-
-    # تحديد توقع الجولة القادمة بذكاء
-    if current_streak >= 3 and repeats >= switches:
-        # الطاولة في خط متسلسل طويل (Dragon/Tiger Run) -> اتبع السلسلة حتى تنكسر
-        next_pred = last_item
-        reason = f"تتبع السلسلة النشطة ({current_streak} مرات متتالية)"
-    elif current_streak == 2 and switches > repeats:
-        # الطاولة تميل للانعكاس السريع بعد مرتين
-        next_pred = opposite
-        reason = "نقطة انعكاس متوقعة بعد جولتين"
-    elif switches > repeats:
-        # نمط تبادلي (واحدة بواحدة - Ping Pong) -> اعكس النتيجة الأخيرة فوراً
-        next_pred = opposite
-        reason = "نمط تبادلي نشط (عكس الجولة السابقة)"
+    if n < min_sample:
+        info_line = f"⚠️ [البيانات غير كافية لجزم علاقة تنبؤية]: مسجل {n}/{min_sample} جولات (المرجع النظري: 46.3%)."
+        conf_str = f"عينة أولية ({n} جولات)"
     else:
-        # مقارنة التوازن العام
-        d_c = non_tie.count("🐉 تنين")
-        t_c = non_tie.count("🐅 تايجر")
-        next_pred = "🐅 تايجر" if d_c > t_c else "🐉 تنين"
-        reason = "تصحيح التوازن الإحصائي للطاولة"
+        info_line = (
+            f"📊 [اختبار Walk-Forward على {trials} جولة حسم]: "
+            f"الدقة المحققة {measured_acc:.1f}% (المرجع 46.3%) | السجل: تنين({d_c}) تايجر({t_c}) تعادل({tie_c}) | آخر نتيجة: {last_seen}"
+        )
+        conf_str = f"اختبار فعلي: {measured_acc:.1f}% (عينة: {n})"
 
-    est_prob = min(74.5, 53.0 + (abs(switches - repeats) * 2.2) + (current_streak * 1.5))
     pred_html = (
-        f"⚡ التوقع المؤكد للجولة القادمة: {next_pred} ({est_prob:.1f}%)<br>"
-        f"<span style='font-size:9px;color:#93c5fd;'>[السبب: {reason}]</span><br>"
-        f"<span style='font-size:9px;color:#fbbf24;'>{cycle_meta['banner']}</span>"
+        f"⚡ التقدير المستقل للجولة التالية: {pred_item} (وزن نسبي: {est_prob:.1f}%)<br>"
+        f"<span style='font-size:9px;color:#cbd5e1;'>[تشخيص السجل: {pattern_desc}]</span><br>"
+        f"<span style='font-size:9px;color:#93c5fd;'>{info_line}</span>"
     )
-    return pred_html, f"{est_prob:.1f}% (توقع القادم)", f"[DT-NEXT] Streak={current_streak} | Next={next_pred}"
+    log_msg = f"[DT-ENGINE] N={n} | Hit={hits}/{trials} ({measured_acc:.1f}%) | Mode={pattern_desc[:18]}"
+    return {
+        "prediction_html": pred_html,
+        "confidence": conf_str,
+        "engine_log": log_msg,
+        "measured_accuracy": round(measured_acc, 1) if trials > 0 else None,
+        "baseline_accuracy": 46.3,
+    }
+
+
+def detect_streak_anomaly(clean_hist: List[str]) -> Tuple[bool, str]:
+    """فحص تكرار النتيجة 5 مرات متتالية دون افتراض حتمية الانعكاس"""
+    if len(clean_hist) >= 5:
+        last_five = clean_hist[-5:]
+        if all(x == last_five[0] for x in last_five):
+            return True, (
+                f"⚠️ [تنبيه تذبذب مبني على البيانات]: النتيجة ({last_five[0]}) تكررت 5 مرات متتالية. "
+                f"هذا يشير إلى تذبذب مرتفع ولا يعني حتمية انعكاس الجولة التالية؛ يُنصح بخفض المخاطرة."
+            )
+    return False, ""
+
+
+# =====================================================================
+# 4. نقاط النهاية (API Endpoints) مع حماية التكرار ومراقبة الصحة
+# =====================================================================
+
+@app.get("/api/health")
+def health_check():
+    state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
+    return {
+        "ok": True,
+        "service": "Phantom Statistical & Lifecycle Server",
+        "version": "120.0",
+        "lifecycle": state,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/config")
+def get_runtime_config():
+    return {
+        "config": lifecycle.config.dict(),
+        "lifecycle": lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False),
+    }
+
+
+@app.post("/api/config")
+def update_runtime_config(new_config: RuntimeConfig):
+    lifecycle.update_config(new_config)
+    return {
+        "ok": True,
+        "message": "تم تحديث إعدادات التشغيل والراحة وحدود الضغط وحفظها بنجاح.",
+        "config": lifecycle.config.dict(),
+    }
+
 
 @app.post("/api/predict")
-def predict(req: PredictionRequest):
-    try:
-        game = req.game_type.upper().strip()
-        clean_hist = [clean_history_item(h) for h in req.history if h and h.strip()]
+async def predict_endpoint(req: PredictionRequest):
+    lifecycle.total_requests += 1
+    state_meta = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=True)
 
-        # 1. فحص دورة السيرفر (الـ 7 ساعات + أوقات اللعب والـ PK)
-        cycle_meta = check_server_cycle_and_time(req.client_hour, req.client_minute, len(clean_hist))
+    game = req.game_type.upper().strip()
+    clean_hist = [normalize_item_name(h) for h in req.history if h and h.strip()]
+    room_key = f"{game}:{req.room_id or 'default'}"
 
-        # 2. فحص تحذير التكرار 5 مرات
-        is_streak_warn, streak_msg = check_streak_warning(clean_hist)
+    # دمج وحفظ سجل الغرفة لمنع ضياع السجل عند الراحة أو انقطاع اتصال المستخدم
+    if clean_hist:
+        lifecycle.room_histories[room_key] = clean_hist[-100:]
+    elif room_key in lifecycle.room_histories:
+        clean_hist = lifecycle.room_histories[room_key]
 
-        # 3. توليد توقع الجولة القادمة حسب اللعبة
-        if "FARM" in game:
-            pred_html, conf_str, log_note = predict_next_farm_round(clean_hist, cycle_meta)
-        elif "POKER" in game:
-            pred_html, conf_str, log_note = predict_next_poker_round(clean_hist, cycle_meta)
-        elif "DRAGON" in game:
-            pred_html, conf_str, log_note = predict_next_dragon_tiger(clean_hist, cycle_meta)
-        else:
-            pred_html, conf_str, log_note = "يرجى اختيار لعبة صالحة.", "--%", "[ERROR] Unknown game"
+    # حماية من تكرار المهام المتطابقة (Task Deduplication)
+    payload_signature = hashlib.sha256(
+        f"{game}|{room_key}|{'|'.join(clean_hist)}|{req.coins}".encode("utf-8")
+    ).hexdigest()
 
-        # إذا كان السيرفر في وقت راحة/تبريد أو هناك تكرار 5 مرات، نبرز التنبيه بوضوح
-        is_danger_mode = cycle_meta["is_resting"] or is_streak_warn
-        if is_streak_warn:
-            pred_html = f"<span style='color:#fca5a5;'>{streak_msg}</span><br><hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
+    now = time.time()
+    if not req.force_refresh and payload_signature in lifecycle.dedup_cache:
+        cached_time, cached_resp = lifecycle.dedup_cache[payload_signature]
+        if now - cached_time <= lifecycle.config.dedup_window_seconds:
+            cached_copy = dict(cached_resp)
+            cached_copy["deduplicated"] = True
+            return cached_copy
 
-        base_bet = int(req.coins * 0.08 * cycle_meta["risk_mult"]) if req.coins > 0 else int(500 * cycle_meta["risk_mult"])
-        if cycle_meta["is_resting"]:
-            safe_amount = 0  # في وقت راحة السيرفر أو الوقت السيئ ينصح بعدم الرهان (0 كوينز)
-        else:
-            safe_amount = base_bet
+    # تنظيم المهام المتزامنة عند ارتفاع الضغط (Concurrency Control)
+    async with lifecycle.semaphore:
+        lifecycle.active_tasks += 1
+        try:
+            min_s = lifecycle.config.min_sample_for_pattern
+            if "FARM" in game:
+                res = run_farm_engine(clean_hist, min_s)
+            elif "POKER" in game:
+                res = run_poker_engine(clean_hist, min_s)
+            elif "DRAGON" in game:
+                res = run_dragon_tiger_engine(clean_hist, min_s)
+            else:
+                raise HTTPException(status_code=400, detail="نوع اللعبة غير مدعوم.")
 
-        return {
-            "is_rigged": is_danger_mode,
-            "server_mood": cycle_meta["mood_badge"],
-            "banner_text": cycle_meta["banner"],
-            "confidence": conf_str,
-            "prediction": pred_html,
-            "safe_bet": safe_amount,
-            "engine_log": log_note,
-            "sample_size": len(clean_hist)
-        }
+            is_warn, warn_text = detect_streak_anomaly(clean_hist)
+            pred_html = res["prediction_html"]
 
-    except Exception as e:
-        return {
-            "is_rigged": False,
-            "server_mood": "🟡 تنبيه معالجة",
-            "banner_text": "جاري إعادة المزامنة...",
-            "confidence": "--%",
-            "prediction": f"⚠️ حدث خطأ أثناء الحساب: {str(e)}",
-            "safe_bet": 0,
-            "engine_log": "[ERROR] Exception in endpoint",
-            "sample_size": 0
-        }
+            # إضافة شريط حالة دورة التشغيل الحقيقية للسيرفر
+            pred_html += (
+                f"<br><span style='font-size:9px;color:#fbbf24;'>"
+                f"⚙️ [حالة الخدمة]: {state_meta['mode_label']} | مراجعة الـ 7س القادمة بعد: {state_meta['next_checkpoint_hours']}س"
+                f"</span>"
+            )
+
+            if is_warn:
+                pred_html = (
+                    f"<span style='color:#fca5a5;'>{warn_text}</span>"
+                    f"<hr style='border-color:#ef4444;margin:4px 0;'>{pred_html}"
+                )
+
+            # حساب إدارة المحفظة المحافظة بناءً على حجم العينة ووجود تحذير تذبذب
+            if len(clean_hist) < min_s:
+                bet_ratio = 0.03
+            elif is_warn:
+                bet_ratio = 0.02
+            else:
+                bet_ratio = 0.06
+
+            safe_bet = int(req.coins * bet_ratio) if req.coins > 0 else 0
+
+            response_payload = {
+                "is_rigged": is_warn,
+                "server_mode": state_meta["mode"],
+                "server_mood": state_meta["mode_label"],
+                "confidence": res["confidence"],
+                "prediction": pred_html,
+                "safe_bet": safe_bet,
+                "engine_log": f"{res['engine_log']} | Mode={state_meta['mode']} | RPM={state_meta['rpm']}",
+                "sample_size": len(clean_hist),
+                "measured_accuracy": res["measured_accuracy"],
+                "baseline_accuracy": res["baseline_accuracy"],
+                "deduplicated": False,
+            }
+
+            lifecycle.dedup_cache[payload_signature] = (now, response_payload)
+            if lifecycle.total_requests % 10 == 0:
+                lifecycle.save_persisted_state()
+
+            return response_payload
+
+        except Exception as exc:
+            lifecycle.error_count += 1
+            logger.exception(f"Prediction error in {game}: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+        finally:
+            lifecycle.active_tasks -= 1
+
 
 @app.get("/")
 def root():
-    elapsed_h = (time.time() - SERVER_START_TIME) / 3600.0
     return {
-        "status": "Phantom Next-Round Predictor v119.0 Active",
-        "uptime_hours": round(elapsed_h, 2),
-        "cycle_rule": "Active 7h / Auto-Rest 30m + PK Time Shield",
-        "developer": "MR"
+        "status": "Phantom Statistical & Lifecycle Server v120.0 Online",
+        "endpoints": ["/api/predict", "/api/health", "/api/config"],
     }
+
 
 if __name__ == "__main__":
     import uvicorn
