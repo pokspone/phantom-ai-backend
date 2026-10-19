@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Learning Engine", version="121.0")
+app = FastAPI(title="Phantom Statistical & Learning Engine", version="121.2")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -232,15 +232,43 @@ class ResellerLoginRequest(BaseModel):
 class ResellerPointsRequest(BaseModel):
     amount: int = Field(ge=-100000000, le=100000000)
     reason: Optional[str] = Field(default="تعديل رصيد بواسطة المالك", max_length=200)
+    confirmation_password: str = Field(min_length=1, max_length=128)
 
 
 class ResellerStatusRequest(BaseModel):
     active: bool
+    confirmation_password: str = Field(min_length=1, max_length=128)
+
+
+class ResellerUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=2, max_length=80)
+    confirmation_password: str = Field(min_length=1, max_length=128)
+
+
+class ResellerCredentialsRequest(BaseModel):
+    username: Optional[str] = Field(default=None, min_length=3, max_length=40)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    confirmation_password: str = Field(min_length=1, max_length=128)
+
+
+class ResellerKeyStatusRequest(BaseModel):
+    status: str = Field(pattern=r"^(active|banned)$")
+    confirmation_password: str = Field(min_length=1, max_length=128)
 
 
 class ResellerKeyRequest(BaseModel):
     key_code: str = Field(min_length=3, max_length=80)
     duration_minutes: int
+
+
+class ChatMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    reseller_id: Optional[str] = Field(default=None, max_length=100)
+
+
+class ChatSettingRequest(BaseModel):
+    enabled: bool
+    confirmation_password: str = Field(min_length=1, max_length=128)
 
 
 class LearningOutcomeRequest(BaseModel):
@@ -498,10 +526,19 @@ def _normalize_reseller_store(data: Any) -> Dict[str, Any]:
         data = {}
     data.setdefault("resellers", {})
     data.setdefault("key_history", [])
+    data.setdefault("audit_log", [])
+    data.setdefault("chat_enabled", True)
+    data.setdefault("chat_messages", [])
     if not isinstance(data["resellers"], dict):
         data["resellers"] = {}
     if not isinstance(data["key_history"], list):
         data["key_history"] = []
+    if not isinstance(data["audit_log"], list):
+        data["audit_log"] = []
+    if not isinstance(data.get("chat_enabled"), bool):
+        data["chat_enabled"] = True
+    if not isinstance(data.get("chat_messages"), list):
+        data["chat_messages"] = []
     return data
 
 
@@ -510,10 +547,10 @@ def _load_reseller_file() -> Dict[str, Any]:
         with open(RESELLER_STATE_FILE, "r", encoding="utf-8") as f:
             return _normalize_reseller_store(json.load(f))
     except FileNotFoundError:
-        return {"resellers": {}, "key_history": []}
+        return {"resellers": {}, "key_history": [], "audit_log": [], "chat_enabled": True, "chat_messages": []}
     except Exception as exc:
         logger.error("Reseller local store load failed: %s", exc)
-        return {"resellers": {}, "key_history": []}
+        return {"resellers": {}, "key_history": [], "audit_log": [], "chat_enabled": True, "chat_messages": []}
 
 
 def _load_reseller_store() -> Dict[str, Any]:
@@ -525,7 +562,7 @@ def _load_reseller_store() -> Dict[str, Any]:
                 logger.info("Loaded reseller accounts from durable Supabase table %s", RESELLER_TABLE)
                 return _normalize_reseller_store(rows[0]["state"])
             logger.info("No reseller state row found in Supabase yet; starting empty")
-            return {"resellers": {}, "key_history": []}
+            return {"resellers": {}, "key_history": [], "audit_log": [], "chat_enabled": True, "chat_messages": []}
         logger.error("Could not load reseller state from Supabase (HTTP %s); refusing to use ephemeral reseller data", status)
         # A bad/missing table must not look like a successful empty persistent store.
         raise RuntimeError(f"Reseller database unavailable (HTTP {status}); check Supabase table and service key")
@@ -628,6 +665,22 @@ def _public_reseller(row: Dict[str, Any]) -> Dict[str, Any]:
             "funded_points_total": int(row.get("funded_points_total", 0)), "vip_bonus_points": int(row.get("vip_bonus_points", 0)),
             "vip_awards": row.get("vip_awards", []), "vip": _vip_details(row),
             "access_policy": "lifetime_until_owner_deactivates"}
+
+def _require_sensitive_confirmation(password: str) -> None:
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=503, detail="تأكيد العمليات الحساسة غير متاح: كلمة مرور المالك غير مضبوطة على السيرفر.")
+    if not hmac.compare_digest(password.strip(), ADMIN_SECRET):
+        lifecycle.record_audit_event("SENSITIVE_ACTION_REJECTED", "Invalid owner confirmation password", "WARNING")
+        raise HTTPException(status_code=403, detail="تأكيد كلمة مرور المالك غير صحيح؛ لم يتم تنفيذ العملية.")
+
+
+def _record_owner_audit(action: str, reseller: Dict[str, Any], details: str) -> None:
+    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "actor": "owner", "action": action,
+             "reseller_id": reseller.get("id"), "reseller_username": reseller.get("username"), "details": details[:300]}
+    reseller_store.setdefault("audit_log", []).append(entry)
+    reseller_store["audit_log"] = reseller_store["audit_log"][-2000:]
+    lifecycle.record_audit_event(action, f"{reseller.get('username')}: {details[:160]}")
+
 
 def _require_admin(token: Optional[str]) -> None:
     if not lifecycle.verify_admin_token(token):
@@ -1540,8 +1593,8 @@ def create_reseller(req: ResellerCreateRequest, x_admin_token: Optional[str] = H
                "balance_after": req.initial_points, "reason": "رصيد افتتاحي من المالك"}]}
         _award_vip_milestones(row)
         reseller_store["resellers"][rid] = row
+        _record_owner_audit("RESELLER_CREATED", row, f"إنشاء حساب وكيل؛ الرصيد الافتتاحي {req.initial_points} نقطة")
         _save_reseller_store()
-        lifecycle.record_audit_event("RESELLER_CREATED", f"Created reseller {username}")
         return {"ok": True, "reseller": _public_reseller(row)}
 
 
@@ -1565,6 +1618,7 @@ def list_reseller_keys(x_admin_token: Optional[str] = Header(default=None)):
 def adjust_reseller_points(reseller_id: str, req: ResellerPointsRequest,
                            x_admin_token: Optional[str] = Header(default=None)):
     _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
     if req.amount == 0:
         raise HTTPException(status_code=400, detail="قيمة تعديل النقاط لا يمكن أن تكون صفرًا.")
     with reseller_lock:
@@ -1583,8 +1637,8 @@ def adjust_reseller_points(reseller_id: str, req: ResellerPointsRequest,
             row["funded_points_total"] = int(row.get("funded_points_total", 0)) + req.amount
             new_awards = _award_vip_milestones(row)
         row["ledger"] = row["ledger"][-500:]
+        _record_owner_audit("RESELLER_POINTS", row, f"{req.amount:+d} نقطة؛ السبب: {(req.reason or '').strip()}")
         _save_reseller_store()
-        lifecycle.record_audit_event("RESELLER_POINTS", f"Reseller {row['username']}: {req.amount:+d} points")
         return {"ok": True, "reseller": _public_reseller(row), "new_vip_awards": new_awards}
 
 
@@ -1592,18 +1646,226 @@ def adjust_reseller_points(reseller_id: str, req: ResellerPointsRequest,
 def set_reseller_status(reseller_id: str, req: ResellerStatusRequest,
                         x_admin_token: Optional[str] = Header(default=None)):
     _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
     with reseller_lock:
         row = reseller_store["resellers"].get(reseller_id)
         if not row:
             raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
         row["active"] = req.active
+        _record_owner_audit("RESELLER_STATUS", row, "تفعيل الوكيل" if req.active else "إيقاف الوكيل وإنهاء الجلسات")
         _save_reseller_store()
         if not req.active:
             for token, session in list(reseller_sessions.items()):
                 if session.get("reseller_id") == reseller_id:
                     reseller_sessions.pop(token, None)
-        lifecycle.record_audit_event("RESELLER_STATUS", f"Reseller {row['username']} active={req.active}")
         return {"ok": True, "reseller": _public_reseller(row)}
+
+
+@app.patch("/api/resellers/{reseller_id}/profile")
+def update_reseller_profile(reseller_id: str, req: ResellerUpdateRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
+    with reseller_lock:
+        row = reseller_store["resellers"].get(reseller_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
+        old = row.get("display_name", "")
+        row["display_name"] = req.display_name.strip()
+        _record_owner_audit("RESELLER_PROFILE_UPDATED", row, f"تغيير الاسم الظاهر من {old} إلى {row['display_name']}")
+        _save_reseller_store()
+        return {"ok": True, "reseller": _public_reseller(row)}
+
+
+@app.patch("/api/resellers/{reseller_id}/credentials")
+def update_reseller_credentials(reseller_id: str, req: ResellerCredentialsRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
+    if not req.username and not req.password:
+        raise HTTPException(status_code=400, detail="أدخل اسم مستخدم جديدًا أو كلمة مرور جديدة على الأقل.")
+    with reseller_lock:
+        row = reseller_store["resellers"].get(reseller_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
+        if req.username:
+            username = req.username.strip().lower()
+            if any(rid != reseller_id and r.get("username", "").lower() == username for rid, r in reseller_store["resellers"].items()):
+                raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
+            old_username = row.get("username", "")
+            row["username"] = username
+        else:
+            old_username = row.get("username", "")
+        changes = []
+        if req.username:
+            changes.append(f"اسم المستخدم {old_username} → {row['username']}")
+        if req.password:
+            salt, digest = _hash_reseller_password(req.password)
+            row["password_salt"], row["password_hash"] = salt, digest
+            changes.append("تغيير كلمة المرور (لا يتم حفظها كنص صريح)")
+        _record_owner_audit("RESELLER_CREDENTIALS_UPDATED", row, "؛ ".join(changes))
+        # Force re-login after credential changes, including all sessions on this worker.
+        for token, session in list(reseller_sessions.items()):
+            if session.get("reseller_id") == reseller_id:
+                reseller_sessions.pop(token, None)
+        _save_reseller_store()
+        return {"ok": True, "reseller": _public_reseller(row), "sessions_revoked": True}
+
+
+@app.get("/api/reseller-audit")
+def list_reseller_audit(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        return {"ok": True, "events": reseller_store.get("audit_log", [])[-500:][::-1]}
+
+
+@app.get("/api/reseller-stats")
+def reseller_statistics(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        rows = list(reseller_store.get("resellers", {}).values())
+        keys = reseller_store.get("key_history", [])
+        by_id = {}
+        for key in keys:
+            rid = key.get("reseller_id")
+            if rid:
+                stats = by_id.setdefault(rid, {"keys_created": 0, "points_spent": 0, "last_key_at": None})
+                stats["keys_created"] += 1
+                stats["points_spent"] += int(key.get("cost_points", 0) or 0)
+                if not stats["last_key_at"] or (key.get("created_at", "") > stats["last_key_at"]):
+                    stats["last_key_at"] = key.get("created_at")
+        items = []
+        for row in rows:
+            stat = by_id.get(row.get("id"), {})
+            items.append({"id": row.get("id"), "username": row.get("username"), "display_name": row.get("display_name"),
+                "active": bool(row.get("active", True)), "points": int(row.get("points", 0)),
+                "keys_created": int(stat.get("keys_created", row.get("keys_created", 0))),
+                "points_spent": int(stat.get("points_spent", 0)), "funded_points_total": int(row.get("funded_points_total", 0)),
+                "last_key_at": stat.get("last_key_at")} )
+        return {"ok": True, "total_resellers": len(rows), "active_resellers": sum(1 for r in rows if r.get("active", True)),
+            "total_keys_created": len(keys), "total_points_available": sum(int(r.get("points", 0)) for r in rows), "resellers": items}
+
+
+@app.post("/api/reseller-keys/{key_code}/status")
+def set_reseller_key_status(key_code: str, req: ResellerKeyStatusRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
+    clean_code = key_code.strip().upper()
+    encoded_code = urllib.parse.quote(clean_code, safe="")
+    status_code, rows = supabase_server_request(f"licenses?key_code=eq.{encoded_code}&select=key_code,status&limit=1", "GET")
+    if status_code != 200 or not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="تعذر قراءة حالة الكود من قاعدة البيانات.")
+    if not rows:
+        raise HTTPException(status_code=404, detail="الكود غير موجود.")
+    status_code, result = supabase_server_request(f"licenses?key_code=eq.{encoded_code}", "PATCH", {"status": req.status})
+    if status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail="تعذر تحديث حالة الكود في قاعدة البيانات.")
+    with reseller_lock:
+        for item in reseller_store.get("key_history", []):
+            if str(item.get("key_code", "")).upper() == clean_code:
+                item["status"] = req.status
+        reseller_store.setdefault("audit_log", []).append({"timestamp": datetime.now(timezone.utc).isoformat(), "actor": "owner",
+            "action": "RESELLER_KEY_STATUS", "reseller_id": None, "reseller_username": None,
+            "details": f"الكود {clean_code}: {rows[0].get('status')} → {req.status}"})
+        reseller_store["audit_log"] = reseller_store["audit_log"][-2000:]
+        _save_reseller_store()
+    lifecycle.record_audit_event("RESELLER_KEY_STATUS", f"Key {clean_code}: {req.status}")
+    return {"ok": True, "key_code": clean_code, "status": req.status}
+
+
+@app.get("/api/admin/chat/settings")
+def admin_chat_settings(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        return {"ok": True, "enabled": bool(reseller_store.get("chat_enabled", True)),
+                "messages_count": len(reseller_store.get("chat_messages", []))}
+
+
+@app.post("/api/admin/chat/settings")
+def update_admin_chat_settings(req: ChatSettingRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    _require_sensitive_confirmation(req.confirmation_password)
+    with reseller_lock:
+        previous = bool(reseller_store.get("chat_enabled", True))
+        reseller_store["chat_enabled"] = req.enabled
+        reseller_store.setdefault("audit_log", []).append({
+            "timestamp": datetime.now(timezone.utc).isoformat(), "actor": "owner",
+            "action": "CHAT_ENABLED" if req.enabled else "CHAT_DISABLED", "reseller_id": None,
+            "reseller_username": None, "details": f"الشات: {previous} → {req.enabled}"})
+        reseller_store["audit_log"] = reseller_store["audit_log"][-2000:]
+        _save_reseller_store()
+    lifecycle.record_audit_event("CHAT_SETTING_CHANGED", f"enabled={req.enabled}")
+    return {"ok": True, "enabled": req.enabled}
+
+
+@app.get("/api/admin/chat/messages")
+def admin_chat_messages(reseller_id: Optional[str] = None, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        rows = reseller_store.get("chat_messages", [])
+        if reseller_id:
+            rows = [m for m in rows if m.get("reseller_id") == reseller_id]
+        return {"ok": True, "enabled": bool(reseller_store.get("chat_enabled", True)), "messages": rows[-500:]}
+
+
+@app.post("/api/admin/chat/messages")
+def admin_send_chat_message(req: ChatMessageRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="الرسالة فارغة.")
+    if not req.reseller_id:
+        raise HTTPException(status_code=400, detail="حدد الوكيل المستهدف.")
+    with reseller_lock:
+        reseller = reseller_store.get("resellers", {}).get(req.reseller_id)
+        if not reseller:
+            raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
+        if not reseller_store.get("chat_enabled", True):
+            raise HTTPException(status_code=403, detail="الشات مغلق من المالك.")
+        item = {"id": uuid.uuid4().hex, "reseller_id": req.reseller_id, "sender_role": "owner",
+                "sender_name": "المالك", "message": message, "created_at": datetime.now(timezone.utc).isoformat(), "read": False}
+        reseller_store.setdefault("chat_messages", []).append(item)
+        reseller_store["chat_messages"] = reseller_store["chat_messages"][-5000:]
+        _save_reseller_store()
+        return {"ok": True, "message": item}
+
+
+@app.get("/api/reseller/chat/messages")
+def reseller_chat_messages(x_reseller_token: Optional[str] = Header(default=None)):
+    with reseller_lock:
+        reseller = _get_reseller_session(x_reseller_token)
+        if not reseller_store.get("chat_enabled", True):
+            raise HTTPException(status_code=403, detail="الشات مغلق حاليًا من المالك.")
+        rows = [m for m in reseller_store.get("chat_messages", []) if m.get("reseller_id") == reseller["id"]]
+        for m in rows:
+            if m.get("sender_role") == "owner": m["read"] = True
+        _save_reseller_store()
+        return {"ok": True, "enabled": True, "messages": rows[-200:]}
+
+
+@app.post("/api/reseller/chat/messages")
+def reseller_send_chat_message(req: ChatMessageRequest, x_reseller_token: Optional[str] = Header(default=None)):
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="الرسالة فارغة.")
+    with reseller_lock:
+        reseller = _get_reseller_session(x_reseller_token)
+        if not reseller_store.get("chat_enabled", True):
+            raise HTTPException(status_code=403, detail="الشات مغلق حاليًا من المالك.")
+        item = {"id": uuid.uuid4().hex, "reseller_id": reseller["id"], "sender_role": "reseller",
+                "sender_name": reseller.get("display_name") or reseller.get("username"), "message": message,
+                "created_at": datetime.now(timezone.utc).isoformat(), "read": False}
+        reseller_store.setdefault("chat_messages", []).append(item)
+        reseller_store["chat_messages"] = reseller_store["chat_messages"][-5000:]
+        _save_reseller_store()
+        return {"ok": True, "message": item}
+
+
+@app.get("/api/admin/backup")
+def admin_backup(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        snapshot = {"format": "phantom-elite-backup-v1", "created_at": datetime.now(timezone.utc).isoformat(),
+                    "reseller_state": copy.deepcopy(reseller_store)}
+    return snapshot
 
 
 @app.post("/api/reseller/login")
@@ -1677,8 +1939,8 @@ def reseller_create_key(req: ResellerKeyRequest, x_reseller_token: Optional[str]
                 "status": "active", "cost_points": cost, "reseller_id": row["id"], "reseller_username": row["username"]}
         reseller_store.setdefault("key_history", []).append(item)
         reseller_store["key_history"] = reseller_store["key_history"][-5000:]
+        _record_owner_audit("RESELLER_KEY_CREATED", row, f"إنشاء الكود {code} وخصم {cost} نقطة")
         _save_reseller_store()
-        lifecycle.record_audit_event("RESELLER_KEY_CREATED", f"{row['username']} created {code}; cost={cost}")
         return {"ok": True, "key": item, "points": new_balance, "message": f"تم إنشاء الكود وخصم {cost} نقطة."}
 
 
