@@ -6,6 +6,9 @@ import math
 import os
 import secrets
 import time
+import threading
+import hmac
+import uuid
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -63,6 +66,32 @@ class AdminLoginRequest(BaseModel):
 class LicenseVerifyRequest(BaseModel):
     key_code: str
     device_token: str
+
+
+class ResellerCreateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=40)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str = Field(min_length=2, max_length=80)
+    initial_points: int = Field(default=0, ge=0, le=100000000)
+
+
+class ResellerLoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=40)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ResellerPointsRequest(BaseModel):
+    amount: int = Field(ge=-100000000, le=100000000)
+    reason: Optional[str] = Field(default="تعديل رصيد بواسطة المالك", max_length=200)
+
+
+class ResellerStatusRequest(BaseModel):
+    active: bool
+
+
+class ResellerKeyRequest(BaseModel):
+    key_code: str = Field(min_length=3, max_length=80)
+    duration_minutes: int
 
 
 class PredictionRequest(BaseModel):
@@ -295,6 +324,65 @@ class ServerLifecycleManager:
 
 
 lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
+
+# بيانات الوكلاء تحفظ في ملف مستقل. في الاستضافة السحابية يجب ربط هذا الملف بقرص دائم.
+RESELLER_STATE_FILE = os.environ.get("PHANTOM_RESELLER_FILE", "phantom_resellers.json")
+reseller_lock = threading.RLock()
+reseller_sessions: Dict[str, Dict[str, Any]] = {}
+
+def _load_reseller_store() -> Dict[str, Any]:
+    try:
+        with open(RESELLER_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("resellers", {})
+            data.setdefault("key_history", [])
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.error("Reseller store load failed: %s", exc)
+    return {"resellers": {}, "key_history": []}
+
+reseller_store = _load_reseller_store()
+
+def _save_reseller_store() -> None:
+    directory = os.path.dirname(os.path.abspath(RESELLER_STATE_FILE))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = RESELLER_STATE_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(reseller_store, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, RESELLER_STATE_FILE)
+
+def _hash_reseller_password(password: str, salt_hex: Optional[str] = None) -> Tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240000).hex()
+    return salt.hex(), digest
+
+def _public_reseller(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": row["id"], "username": row["username"], "display_name": row["display_name"],
+            "points": int(row.get("points", 0)), "active": bool(row.get("active", True)),
+            "created_at": row.get("created_at"), "keys_created": int(row.get("keys_created", 0))}
+
+def _require_admin(token: Optional[str]) -> None:
+    if not lifecycle.verify_admin_token(token):
+        raise HTTPException(status_code=401, detail="جلسة الأدمن غير صالحة أو انتهت. سجّل الدخول مرة أخرى.")
+
+def _get_reseller_session(token: Optional[str]) -> Dict[str, Any]:
+    if not token:
+        raise HTTPException(status_code=401, detail="سجّل الدخول بحساب الوكيل أولاً.")
+    session = reseller_sessions.get(token)
+    if not session or session.get("expires_at", 0) <= time.time():
+        reseller_sessions.pop(token, None)
+        raise HTTPException(status_code=401, detail="انتهت جلسة الوكيل. سجّل الدخول مرة أخرى.")
+    reseller = reseller_store["resellers"].get(session["reseller_id"])
+    if not reseller or not reseller.get("active", True):
+        reseller_sessions.pop(token, None)
+        raise HTTPException(status_code=403, detail="حساب الوكيل موقوف.")
+    return reseller
+
 lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.6 initialized.")
 
 
@@ -1017,8 +1105,9 @@ def admin_login_endpoint(req: AdminLoginRequest, request: Request):
 
 @app.get("/api/admin/telemetry")
 def admin_telemetry_endpoint(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
     state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
-    token_valid = lifecycle.verify_admin_token(x_admin_token)
+    token_valid = True
     room_summary = {k: len(v) for k, v in lifecycle.room_histories.items()}
 
     return {
@@ -1129,13 +1218,170 @@ def get_runtime_config():
 
 
 @app.post("/api/config")
-def update_runtime_config(new_config: RuntimeConfig):
+def update_runtime_config(new_config: RuntimeConfig, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
     lifecycle.update_config(new_config)
     return {
         "ok": True,
         "message": "تم تحديث إعدادات التشغيل والراحة وحدود الضغط وحفظها بنجاح.",
         "config": lifecycle.config.dict(),
     }
+
+
+@app.post("/api/resellers")
+def create_reseller(req: ResellerCreateRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    username = req.username.strip().lower()
+    if not username.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="اسم المستخدم يقبل الحروف والأرقام والشرطة فقط.")
+    with reseller_lock:
+        if any(r.get("username", "").lower() == username for r in reseller_store["resellers"].values()):
+            raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
+        salt, digest = _hash_reseller_password(req.password)
+        rid = uuid.uuid4().hex
+        row = {"id": rid, "username": username, "display_name": req.display_name.strip(),
+               "password_salt": salt, "password_hash": digest, "points": req.initial_points,
+               "active": True, "created_at": datetime.now(timezone.utc).isoformat(),
+               "keys_created": 0, "ledger": [{"timestamp": datetime.now(timezone.utc).isoformat(),
+               "type": "CREATE", "amount": req.initial_points, "balance_after": req.initial_points,
+               "reason": "رصيد افتتاحي"}]}
+        reseller_store["resellers"][rid] = row
+        _save_reseller_store()
+        lifecycle.record_audit_event("RESELLER_CREATED", f"Created reseller {username}")
+        return {"ok": True, "reseller": _public_reseller(row)}
+
+
+@app.get("/api/resellers")
+def list_resellers(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        rows = [_public_reseller(r) for r in reseller_store["resellers"].values()]
+        rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        return {"ok": True, "resellers": rows}
+
+
+@app.get("/api/reseller-keys")
+def list_reseller_keys(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        return {"ok": True, "keys": reseller_store.get("key_history", [])[-1000:][::-1]}
+
+
+@app.post("/api/resellers/{reseller_id}/points")
+def adjust_reseller_points(reseller_id: str, req: ResellerPointsRequest,
+                           x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    if req.amount == 0:
+        raise HTTPException(status_code=400, detail="قيمة تعديل النقاط لا يمكن أن تكون صفرًا.")
+    with reseller_lock:
+        row = reseller_store["resellers"].get(reseller_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
+        new_balance = int(row.get("points", 0)) + req.amount
+        if new_balance < 0:
+            raise HTTPException(status_code=400, detail="لا يمكن خصم نقاط أكثر من الرصيد الحالي.")
+        row["points"] = new_balance
+        row.setdefault("ledger", []).append({"timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "CREDIT" if req.amount > 0 else "DEBIT", "amount": req.amount,
+            "balance_after": new_balance, "reason": (req.reason or "تعديل بواسطة المالك").strip()})
+        row["ledger"] = row["ledger"][-500:]
+        _save_reseller_store()
+        lifecycle.record_audit_event("RESELLER_POINTS", f"Reseller {row['username']}: {req.amount:+d} points")
+        return {"ok": True, "reseller": _public_reseller(row)}
+
+
+@app.post("/api/resellers/{reseller_id}/status")
+def set_reseller_status(reseller_id: str, req: ResellerStatusRequest,
+                        x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    with reseller_lock:
+        row = reseller_store["resellers"].get(reseller_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="الوكيل غير موجود.")
+        row["active"] = req.active
+        _save_reseller_store()
+        if not req.active:
+            for token, session in list(reseller_sessions.items()):
+                if session.get("reseller_id") == reseller_id:
+                    reseller_sessions.pop(token, None)
+        lifecycle.record_audit_event("RESELLER_STATUS", f"Reseller {row['username']} active={req.active}")
+        return {"ok": True, "reseller": _public_reseller(row)}
+
+
+@app.post("/api/reseller/login")
+def reseller_login(req: ResellerLoginRequest):
+    username = req.username.strip().lower()
+    with reseller_lock:
+        row = next((r for r in reseller_store["resellers"].values() if r.get("username", "").lower() == username), None)
+        if not row or not row.get("active", True):
+            raise HTTPException(status_code=401, detail="بيانات الدخول غير صحيحة أو الحساب موقوف.")
+        _, digest = _hash_reseller_password(req.password, row.get("password_salt"))
+        if not hmac.compare_digest(digest, row.get("password_hash", "")):
+            raise HTTPException(status_code=401, detail="بيانات الدخول غير صحيحة أو الحساب موقوف.")
+        token = secrets.token_urlsafe(36)
+        reseller_sessions[token] = {"reseller_id": row["id"], "expires_at": time.time() + 12 * 3600}
+        return {"ok": True, "token": token, "reseller": _public_reseller(row)}
+
+
+@app.get("/api/reseller/me")
+def reseller_me(x_reseller_token: Optional[str] = Header(default=None)):
+    with reseller_lock:
+        row = _get_reseller_session(x_reseller_token)
+        own_keys = [k for k in reseller_store.get("key_history", []) if k.get("reseller_id") == row["id"]]
+        return {"ok": True, "reseller": _public_reseller(row), "keys": own_keys[-200:][::-1],
+                "ledger": row.get("ledger", [])[-100:][::-1]}
+
+
+@app.post("/api/reseller/keys")
+def reseller_create_key(req: ResellerKeyRequest, x_reseller_token: Optional[str] = Header(default=None)):
+    code = req.key_code.strip().upper()
+    if req.duration_minutes not in (60, 1440):
+        raise HTTPException(status_code=400, detail="المدة المسموحة ساعة واحدة أو يوم كامل فقط.")
+    if not code or any(ch.isspace() for ch in code):
+        raise HTTPException(status_code=400, detail="الكود مطلوب ولا يجب أن يحتوي على مسافات.")
+    cost = 1 if req.duration_minutes == 60 else 24
+    with reseller_lock:
+        row = _get_reseller_session(x_reseller_token)
+        # افحص التكرار قبل خصم النقاط، ثم يظل قيد التفرد في قاعدة البيانات مهمًا لمنع السباق.
+        encoded_code = urllib.parse.quote(code, safe="")
+        check_status, existing_rows = supabase_server_request(
+            f"licenses?key_code=eq.{encoded_code}&select=key_code&limit=1", "GET")
+        if check_status != 200 or not isinstance(existing_rows, list):
+            raise HTTPException(status_code=502, detail="تعذر التأكد من عدم تكرار الكود. لم يتم خصم نقاط.")
+        if existing_rows:
+            raise HTTPException(status_code=409, detail="هذا الكود موجود بالفعل. اختر كودًا مختلفًا.")
+        if int(row.get("points", 0)) < cost:
+            raise HTTPException(status_code=402, detail=f"رصيدك غير كافٍ. تحتاج {cost} نقطة والمتاح {row.get('points', 0)}.")
+        # احجز النقاط واحفظ الخصم أولاً؛ لو فشل إدخال الكود نرجع الرصيد تلقائياً.
+        old_balance = int(row.get("points", 0))
+        old_keys_created = int(row.get("keys_created", 0))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        ledger_entry = {"timestamp": now_iso, "type": "KEY_COST", "amount": -cost,
+            "balance_after": old_balance - cost, "reason": f"إنشاء كود {code} ({'ساعة' if req.duration_minutes == 60 else '24 ساعة'})"}
+        row["points"] = old_balance - cost
+        row["keys_created"] = old_keys_created + 1
+        row.setdefault("ledger", []).append(ledger_entry)
+        row["ledger"] = row["ledger"][-500:]
+        _save_reseller_store()
+        payload = [{"key_code": code, "duration_minutes": req.duration_minutes, "status": "active",
+                    "bound_device": None, "created_at": now_iso}]
+        status_code, result = supabase_server_request("licenses", "POST", payload)
+        if status_code not in (200, 201) or isinstance(result, dict) and result.get("error"):
+            row["points"] = old_balance
+            row["keys_created"] = old_keys_created
+            if row.get("ledger") and row["ledger"][-1] is ledger_entry:
+                row["ledger"].pop()
+            _save_reseller_store()
+            detail = result.get("error", "تعذر إنشاء الكود في قاعدة البيانات.") if isinstance(result, dict) else "تعذر إنشاء الكود في قاعدة البيانات."
+            raise HTTPException(status_code=409 if status_code == 409 else 502, detail=str(detail)[:240])
+        new_balance = int(row["points"])
+        item = {"key_code": code, "duration_minutes": req.duration_minutes, "created_at": now_iso,
+                "status": "active", "cost_points": cost, "reseller_id": row["id"], "reseller_username": row["username"]}
+        reseller_store.setdefault("key_history", []).append(item)
+        reseller_store["key_history"] = reseller_store["key_history"][-5000:]
+        _save_reseller_store()
+        lifecycle.record_audit_event("RESELLER_KEY_CREATED", f"{row['username']} created {code}; cost={cost}")
+        return {"ok": True, "key": item, "points": new_balance, "message": f"تم إنشاء الكود وخصم {cost} نقطة."}
 
 
 @app.post("/api/predict")
