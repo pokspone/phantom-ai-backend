@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -29,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Learning Engine", version="120.7")
+app = FastAPI(title="Phantom Statistical & Learning Engine", version="120.9")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -43,14 +44,50 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-Admin-Token", "X-Reseller-Token", "Authorization", "apikey"],
 )
 
-STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.json")
+def _storage_path(env_name: str, default_name: str) -> str:
+    """Resolve a writable local path without assuming a Railway Volume exists.
+
+    An explicitly configured /data path is accepted only when /data is an actual
+    mount point and writable. Otherwise, safely fall back to a local file in the
+    application working directory so a missing Volume cannot crash startup.
+    Local fallback is ephemeral on Railway; the startup log makes that explicit.
+    """
+    configured = os.environ.get(env_name, "").strip()
+    candidate = configured or default_name
+    parent = os.path.dirname(os.path.abspath(candidate))
+    is_data_path = os.path.abspath(candidate).startswith(os.path.abspath("/data") + os.sep) or os.path.abspath(candidate) == os.path.abspath("/data")
+    try:
+        if is_data_path and not os.path.ismount("/data"):
+            raise OSError("/data is not a mounted Volume")
+        if not os.path.isdir(parent):
+            raise OSError(f"directory does not exist: {parent}")
+        if not os.access(parent, os.W_OK | os.X_OK):
+            raise OSError(f"directory is not writable: {parent}")
+        # Check actual write access, not just permission bits.
+        probe = os.path.join(parent, f".phantom_write_test_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        if configured:
+            logger.info("Storage path %s -> %s", env_name, candidate)
+        else:
+            logger.warning("%s not set; using local ephemeral storage path %s", env_name, candidate)
+        return candidate
+    except Exception as exc:
+        fallback = os.path.abspath(default_name)
+        logger.warning("Storage path %s=%r is unavailable (%s); falling back to %s. Data may be lost on redeploy.", env_name, candidate, exc, fallback)
+        return fallback
+
+
+STATE_FILE_PATH = _storage_path("PHANTOM_STATE_FILE", "phantom_server_state.json")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uimxwispsiqalizeppqw.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_OxyjnNeEhj3G1MpmgnznIg_I1Hm69p1")
 ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "").strip()
-LEARNING_FILE_PATH = os.environ.get("PHANTOM_LEARNING_FILE", "phantom_learning.json")
+LEARNING_FILE_PATH = _storage_path("PHANTOM_LEARNING_FILE", "phantom_learning.json")
 # Durable learning storage: use a server-only Supabase secret when configured.
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 LEARNING_TABLE = os.environ.get("PHANTOM_LEARNING_TABLE", "phantom_learning_records")
+RESELLER_TABLE = os.environ.get("PHANTOM_RESELLER_TABLE", "phantom_reseller_state")
 _learning_lock = threading.RLock()
 _learning_rate_lock = threading.RLock()
 _learning_request_times: Dict[str, List[float]] = {}
@@ -450,33 +487,88 @@ class ServerLifecycleManager:
 
 lifecycle = ServerLifecycleManager(STATE_FILE_PATH)
 
-# بيانات الوكلاء تحفظ في ملف مستقل. في الاستضافة السحابية يجب ربط هذا الملف بقرص دائم.
-RESELLER_STATE_FILE = os.environ.get("PHANTOM_RESELLER_FILE", "phantom_resellers.json")
+# بيانات الوكلاء: Supabase هو التخزين الدائم الأساسي عند ضبط مفتاح الخدمة؛ JSON بديل محلي فقط.
+RESELLER_STATE_FILE = _storage_path("PHANTOM_RESELLER_FILE", "phantom_resellers.json")
 reseller_lock = threading.RLock()
 reseller_sessions: Dict[str, Dict[str, Any]] = {}
 
-def _load_reseller_store() -> Dict[str, Any]:
+
+def _normalize_reseller_store(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("resellers", {})
+    data.setdefault("key_history", [])
+    if not isinstance(data["resellers"], dict):
+        data["resellers"] = {}
+    if not isinstance(data["key_history"], list):
+        data["key_history"] = []
+    return data
+
+
+def _load_reseller_file() -> Dict[str, Any]:
     try:
         with open(RESELLER_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            data.setdefault("resellers", {})
-            data.setdefault("key_history", [])
-            return data
+            return _normalize_reseller_store(json.load(f))
     except FileNotFoundError:
-        pass
+        return {"resellers": {}, "key_history": []}
     except Exception as exc:
-        logger.error("Reseller store load failed: %s", exc)
-    return {"resellers": {}, "key_history": []}
+        logger.error("Reseller local store load failed: %s", exc)
+        return {"resellers": {}, "key_history": []}
+
+
+def _load_reseller_store() -> Dict[str, Any]:
+    # Load the persistent database first. Never silently prefer ephemeral JSON when DB is configured.
+    if SUPABASE_SERVICE_ROLE_KEY:
+        status, rows = _learning_db_request(f"{RESELLER_TABLE}?id=eq.primary&select=state&limit=1")
+        if status == 200 and isinstance(rows, list):
+            if rows and isinstance(rows[0].get("state"), dict):
+                logger.info("Loaded reseller accounts from durable Supabase table %s", RESELLER_TABLE)
+                return _normalize_reseller_store(rows[0]["state"])
+            logger.info("No reseller state row found in Supabase yet; starting empty")
+            return {"resellers": {}, "key_history": []}
+        logger.error("Could not load reseller state from Supabase (HTTP %s); refusing to use ephemeral reseller data", status)
+        # A bad/missing table must not look like a successful empty persistent store.
+        raise RuntimeError(f"Reseller database unavailable (HTTP {status}); check Supabase table and service key")
+    logger.warning("SUPABASE_SERVICE_ROLE_KEY not configured; reseller data uses local storage and may be lost on redeploy")
+    return _load_reseller_file()
+
 
 reseller_store = _load_reseller_store()
+_last_persisted_reseller_store = copy.deepcopy(reseller_store)
+
 
 def _save_reseller_store() -> None:
+    global reseller_store, _last_persisted_reseller_store
+    snapshot = copy.deepcopy(reseller_store)
+    if SUPABASE_SERVICE_ROLE_KEY:
+        # Upsert one JSONB state row. The table must be created using the supplied SQL setup file.
+        url = f"{SUPABASE_URL}/rest/v1/{RESELLER_TABLE}?on_conflict=id"
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        payload = [{"id": "primary", "state": snapshot, "updated_at": datetime.now(timezone.utc).isoformat()}]
+        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status not in (200, 201, 204):
+                    raise RuntimeError(f"Supabase reseller state save returned HTTP {resp.status}")
+        except Exception as exc:
+            # Roll back in-memory changes; don't claim a write succeeded if durable storage failed.
+            logger.error("Durable reseller save failed; rolling back in-memory state: %s", exc)
+            reseller_store = copy.deepcopy(_last_persisted_reseller_store)
+            raise RuntimeError("تعذر حفظ بيانات الوكلاء في التخزين الدائم؛ لم يتم اعتماد التغيير. تحقق من إعدادات Supabase.") from exc
+        _last_persisted_reseller_store = copy.deepcopy(snapshot)
+    else:
+        logger.warning("Saving reseller state to local JSON only; this is not durable on Railway")
     directory = os.path.dirname(os.path.abspath(RESELLER_STATE_FILE))
     os.makedirs(directory, exist_ok=True)
     tmp_path = RESELLER_STATE_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(reseller_store, f, ensure_ascii=False, indent=2)
+        json.dump(snapshot, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, RESELLER_STATE_FILE)
@@ -554,7 +646,7 @@ def _get_reseller_session(token: Optional[str]) -> Dict[str, Any]:
         raise HTTPException(status_code=403, detail="حساب الوكيل موقوف.")
     return reseller
 
-lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.7 initialized.")
+lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.8 initialized.")
 
 
 # =====================================================================
@@ -1355,11 +1447,26 @@ def verify_license_proxy(req: LicenseVerifyRequest):
 @app.get("/api/health")
 def health_check():
     state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
+    reseller_db_check = "not_configured"
+    if SUPABASE_SERVICE_ROLE_KEY:
+        db_status, db_rows = _learning_db_request(f"{RESELLER_TABLE}?select=id&limit=1")
+        reseller_db_check = "connected" if db_status == 200 and isinstance(db_rows, list) else f"error_{db_status}"
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.7",
+        "version": "120.9",
         "lifecycle": state,
+        "storage": {
+            "mode": "supabase_reseller_state" if SUPABASE_SERVICE_ROLE_KEY else ("railway_volume" if os.path.ismount("/data") else "local_ephemeral"),
+            "data_mount_detected": os.path.ismount("/data"),
+            "reseller_durable_storage_configured": bool(SUPABASE_SERVICE_ROLE_KEY),
+            "reseller_database_connection": reseller_db_check,
+            "reseller_table": RESELLER_TABLE if SUPABASE_SERVICE_ROLE_KEY else None,
+            "state_path": STATE_FILE_PATH,
+            "reseller_path": RESELLER_STATE_FILE,
+            "learning_path": LEARNING_FILE_PATH,
+            "warning": (None if SUPABASE_SERVICE_ROLE_KEY else ("لا يوجد Volume مركّب عند /data؛ ملفات الوكلاء محلية وقد تضيع بعد إعادة النشر. فعّل Supabase باستخدام ملف SQL المرفق." if not os.path.ismount("/data") else "ملف الوكلاء لا يزال محليًا؛ تأكد من أن مساره داخل Volume.")),
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1580,6 +1687,8 @@ async def record_learning_outcome(req: LearningOutcomeRequest, request: Request)
         "hit": actual in predicted,
         "history_size": len(req.history_before),
         "source": "client_reported",
+        "verified": False,
+        "verification_status": "unverified_client_report",
         "probabilities": {str(k)[:80]: max(0.0, min(100.0, float(v))) for k, v in list(req.probabilities.items())[:20] if isinstance(v, (int, float)) and math.isfinite(float(v))},
         "client_ip_hash": hashlib.sha256((request.client.host if request.client else "unknown").encode()).hexdigest()[:16],
     }
@@ -1604,22 +1713,25 @@ def learning_stats():
         records = list(learning_store.get("records", []))
     games: Dict[str, Any] = {}
     for game in ("DRAGON", "FARM", "POKER"):
-        rows = [r for r in records if r.get("game") == game]
+        all_rows = [r for r in records if r.get("game") == game]
+        verified_rows = [r for r in all_rows if r.get("verified") is True and r.get("source") in {"admin_verified", "official_result_feed"}]
         out = {}
         for window in (50, 100, 500):
-            recent = rows[-window:]
+            recent = verified_rows[-window:]
             out[str(window)] = {
                 "trials": len(recent),
                 "hits": sum(1 for r in recent if r.get("hit")),
                 "accuracy": round(sum(1 for r in recent if r.get("hit")) / len(recent) * 100, 2) if recent else None,
             }
         metric = {"DRAGON": "إصابة توقع واحد", "FARM": "تغطية أفضل 5 عناصر", "POKER": "تغطية الخانتين الأولى والثانية"}[game]
-        games[game] = {"total": len(rows), "metric": metric, "windows": out}
+        games[game] = {"total_reports": len(all_rows), "verified_trials": len(verified_rows), "metric": metric,
+                       "windows": out, "unverified_reports": len(all_rows) - len(verified_rows)}
     durable = bool(SUPABASE_SERVICE_ROLE_KEY and db_store is not None)
     return {"ok": True, "total_records": len(records), "games": games,
             "storage": "supabase" if durable else "local_fallback",
             "durable_storage": durable,
-            "note": "تعتمد الدقة على النتائج الفعلية التي تم إدخالها بعد التوقع؛ لا تمثل ضمانًا للنتيجة التالية. مقاييس الألعاب مختلفة ولا تُقارن مباشرةً."}
+            "accuracy_basis": "verified_only",
+            "note": "النتائج التي يرسلها العميل تُسجّل كتقارير غير مؤكدة ولا تدخل في حساب الدقة. لا تُحتسب الدقة إلا بعد التحقق الإداري أو عبر مصدر نتائج رسمي موثوق. لا تمثل الدقة ضمانًا للنتيجة التالية."}
 
 
 def normalize_dt_outcome(raw: str) -> str:
@@ -1769,7 +1881,7 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.7 Online",
+        "status": "Phantom Statistical & Lifecycle Server v120.8 Online",
         "endpoints": [
             "/api/predict",
             "/api/health",
