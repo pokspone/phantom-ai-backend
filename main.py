@@ -41,7 +41,7 @@ app.add_middleware(
 STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.json")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uimxwispsiqalizeppqw.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_OxyjnNeEhj3G1MpmgnznIg_I1Hm69p1")
-ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "JAKYMR77")
+ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "").strip()
 LEARNING_FILE_PATH = os.environ.get("PHANTOM_LEARNING_FILE", "phantom_learning.json")
 # Durable learning storage: use a server-only Supabase secret when configured.
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -457,10 +457,56 @@ def _hash_reseller_password(password: str, salt_hex: Optional[str] = None) -> Tu
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240000).hex()
     return salt.hex(), digest
 
+# VIP tiers count only lifetime points credited by the owner; gifts and spending do not count.
+VIP_TIERS = [
+    {"name": "Bronze", "name_ar": "برونزي", "threshold": 100, "gift": 10, "medal": "🥉", "badge": "وسام البرونز"},
+    {"name": "Silver", "name_ar": "فضي", "threshold": 500, "gift": 40, "medal": "🥈", "badge": "وسام الفضة"},
+    {"name": "Gold", "name_ar": "ذهبي", "threshold": 1500, "gift": 120, "medal": "🥇", "badge": "وسام الذهب"},
+    {"name": "Platinum", "name_ar": "بلاتيني", "threshold": 5000, "gift": 400, "medal": "💎", "badge": "وسام البلاتين"},
+    {"name": "Diamond", "name_ar": "ماسي", "threshold": 15000, "gift": 1500, "medal": "👑", "badge": "وسام الماس"},
+]
+
+def _vip_details(row: Dict[str, Any]) -> Dict[str, Any]:
+    funded = max(0, int(row.get("funded_points_total", 0)))
+    reached = [tier for tier in VIP_TIERS if funded >= tier["threshold"]]
+    current = reached[-1] if reached else {"name": "Starter", "name_ar": "مبتدئ", "threshold": 0, "gift": 0, "medal": "♜", "badge": "وسام البداية"}
+    nxt = next((tier for tier in VIP_TIERS if funded < tier["threshold"]), None)
+    percent = 100 if not nxt else max(0, min(100, round((funded-current["threshold"])*100/max(1,nxt["threshold"]-current["threshold"]))))
+    return {"name": current["name"], "name_ar": current["name_ar"], "medal": current["medal"], "badge": current["badge"],
+            "threshold": current["threshold"], "gift_points": current["gift"], "next_name": nxt["name"] if nxt else None,
+            "next_threshold": nxt["threshold"] if nxt else None, "points_to_next": max(0,nxt["threshold"]-funded) if nxt else 0,
+            "progress_percent": percent}
+
+def _award_vip_milestones(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    funded = max(0, int(row.get("funded_points_total", 0)))
+    awards = row.setdefault("vip_awards", [])
+    known = {int(item.get("threshold", 0)) for item in awards}
+    new_awards = []
+    for tier in VIP_TIERS:
+        if funded >= tier["threshold"] and tier["threshold"] not in known:
+            bonus = int(tier["gift"])
+            row["points"] = int(row.get("points", 0)) + bonus
+            row["vip_bonus_points"] = int(row.get("vip_bonus_points", 0)) + bonus
+            timestamp = datetime.now(timezone.utc).isoformat()
+            award = {"timestamp": timestamp, "tier": tier["name"], "threshold": tier["threshold"], "bonus_points": bonus, "badge": tier["badge"]}
+            awards.append(award)
+            row.setdefault("ledger", []).append({"timestamp": timestamp, "type": "VIP_BONUS", "amount": bonus,
+                "balance_after": row["points"], "reason": f"مكافأة ترقية VIP {tier['name']} - {tier['badge']}"})
+            new_awards.append(award)
+    row["vip_awards"] = awards[-20:]
+    row["ledger"] = row.get("ledger", [])[-500:]
+    return new_awards
+
 def _public_reseller(row: Dict[str, Any]) -> Dict[str, Any]:
+    row.setdefault("funded_points_total", 0)
+    row.setdefault("vip_bonus_points", 0)
+    row.setdefault("vip_awards", [])
     return {"id": row["id"], "username": row["username"], "display_name": row["display_name"],
             "points": int(row.get("points", 0)), "active": bool(row.get("active", True)),
-            "created_at": row.get("created_at"), "keys_created": int(row.get("keys_created", 0))}
+            "created_at": row.get("created_at"), "keys_created": int(row.get("keys_created", 0)),
+            "funded_points_total": int(row.get("funded_points_total", 0)), "vip_bonus_points": int(row.get("vip_bonus_points", 0)),
+            "vip_awards": row.get("vip_awards", []), "vip": _vip_details(row),
+            "access_policy": "lifetime_until_owner_deactivates"}
 
 def _require_admin(token: Optional[str]) -> None:
     if not lifecycle.verify_admin_token(token):
@@ -1161,7 +1207,10 @@ def admin_login_endpoint(req: AdminLoginRequest, request: Request):
         raise HTTPException(status_code=403, detail="يجب إكمال 6 ضغطات متتالية لفتح بوابة التصريح.")
 
     clean_pass = req.password.strip()
-    if clean_pass == ADMIN_SECRET:
+    if not ADMIN_SECRET:
+        logger.error("PHANTOM_ADMIN_PASS is not configured; admin login is disabled.")
+        raise HTTPException(status_code=503, detail="لم يتم ضبط كلمة مرور الأدمن على السيرفر بعد.")
+    if hmac.compare_digest(clean_pass, ADMIN_SECRET):
         admin_token = lifecycle.create_admin_session(client_ip)
         status_code, _ = supabase_server_request("licenses?select=key_code&limit=1", "GET")
         db_connected = status_code == 200
@@ -1319,9 +1368,10 @@ def create_reseller(req: ResellerCreateRequest, x_admin_token: Optional[str] = H
         row = {"id": rid, "username": username, "display_name": req.display_name.strip(),
                "password_salt": salt, "password_hash": digest, "points": req.initial_points,
                "active": True, "created_at": datetime.now(timezone.utc).isoformat(),
-               "keys_created": 0, "ledger": [{"timestamp": datetime.now(timezone.utc).isoformat(),
-               "type": "CREATE", "amount": req.initial_points, "balance_after": req.initial_points,
-               "reason": "رصيد افتتاحي"}]}
+               "keys_created": 0, "funded_points_total": int(req.initial_points), "vip_bonus_points": 0, "vip_awards": [],
+               "ledger": [{"timestamp": datetime.now(timezone.utc).isoformat(), "type": "CREATE", "amount": req.initial_points,
+               "balance_after": req.initial_points, "reason": "رصيد افتتاحي من المالك"}]}
+        _award_vip_milestones(row)
         reseller_store["resellers"][rid] = row
         _save_reseller_store()
         lifecycle.record_audit_event("RESELLER_CREATED", f"Created reseller {username}")
@@ -1361,10 +1411,14 @@ def adjust_reseller_points(reseller_id: str, req: ResellerPointsRequest,
         row.setdefault("ledger", []).append({"timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "CREDIT" if req.amount > 0 else "DEBIT", "amount": req.amount,
             "balance_after": new_balance, "reason": (req.reason or "تعديل بواسطة المالك").strip()})
+        new_awards = []
+        if req.amount > 0:
+            row["funded_points_total"] = int(row.get("funded_points_total", 0)) + req.amount
+            new_awards = _award_vip_milestones(row)
         row["ledger"] = row["ledger"][-500:]
         _save_reseller_store()
         lifecycle.record_audit_event("RESELLER_POINTS", f"Reseller {row['username']}: {req.amount:+d} points")
-        return {"ok": True, "reseller": _public_reseller(row)}
+        return {"ok": True, "reseller": _public_reseller(row), "new_vip_awards": new_awards}
 
 
 @app.post("/api/resellers/{reseller_id}/status")
