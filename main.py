@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Lifecycle Engine", version="120.6")
+app = FastAPI(title="Phantom Statistical & Learning Engine", version="120.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +42,92 @@ STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.jso
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uimxwispsiqalizeppqw.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_OxyjnNeEhj3G1MpmgnznIg_I1Hm69p1")
 ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "JAKYMR77")
+LEARNING_FILE_PATH = os.environ.get("PHANTOM_LEARNING_FILE", "phantom_learning.json")
+# Durable learning storage: use a server-only Supabase secret when configured.
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+LEARNING_TABLE = os.environ.get("PHANTOM_LEARNING_TABLE", "phantom_learning_records")
+_learning_lock = threading.RLock()
+
+
+def _learning_db_request(path: str, method: str = "GET", payload: Any = None) -> Tuple[int, Any]:
+    """Use the Supabase service-role key only on the backend; never expose it to the client."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return 503, {"error": "SUPABASE_SERVICE_ROLE_KEY is not configured"}
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if method in ("POST", "PATCH"):
+        headers["Prefer"] = "return=representation"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else []
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        logger.error("Learning database HTTP %s: %s", exc.code, detail[:500])
+        return exc.code, {"error": detail}
+    except Exception as exc:
+        logger.error("Learning database request failed: %s", exc)
+        return 503, {"error": str(exc)}
+
+
+def _load_learning_from_supabase() -> Optional[Dict[str, Any]]:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    path = f"{LEARNING_TABLE}?select=record&order=created_at.desc&limit=10000"
+    status, rows = _learning_db_request(path)
+    if status != 200 or not isinstance(rows, list):
+        logger.warning("Could not load learning records from Supabase; using local file fallback")
+        return None
+    records = [row.get("record") for row in reversed(rows) if isinstance(row, dict) and isinstance(row.get("record"), dict)]
+    logger.info("Loaded %s learning records from Supabase", len(records))
+    return {"records": records[-10000:]}
+
+
+def _persist_learning_record(record: Dict[str, Any]) -> bool:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    payload = {"id": record["id"], "created_at": record["timestamp"], "record": record}
+    status, result = _learning_db_request(LEARNING_TABLE, "POST", payload)
+    if status not in (200, 201):
+        logger.error("Learning record was not saved to Supabase (HTTP %s)", status)
+        return False
+    return True
+
+
+def _load_learning_store() -> Dict[str, Any]:
+    try:
+        with _learning_lock:
+            if os.path.exists(LEARNING_FILE_PATH):
+                with open(LEARNING_FILE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("records", []), list):
+                    return {"records": data.get("records", [])[-10000:]}
+    except Exception as exc:
+        logger.warning("Learning store load failed: %s", exc)
+    return {"records": []}
+
+
+def _save_learning_store(store: Dict[str, Any]) -> None:
+    try:
+        directory = os.path.dirname(os.path.abspath(LEARNING_FILE_PATH))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = LEARNING_FILE_PATH + ".tmp"
+        with _learning_lock:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump({"records": store.get("records", [])[-10000:]}, f, ensure_ascii=False)
+            os.replace(temp_path, LEARNING_FILE_PATH)
+    except Exception as exc:
+        logger.error("Learning store save failed: %s", exc)
+
+
+learning_store = _load_learning_from_supabase() or _load_learning_store()
 
 
 # =====================================================================
@@ -92,6 +178,16 @@ class ResellerStatusRequest(BaseModel):
 class ResellerKeyRequest(BaseModel):
     key_code: str = Field(min_length=3, max_length=80)
     duration_minutes: int
+
+
+class LearningOutcomeRequest(BaseModel):
+    game_type: str = Field(min_length=3, max_length=20)
+    room_id: Optional[str] = Field(default="default", max_length=100)
+    actual: str = Field(min_length=1, max_length=100)
+    predicted: List[str] = Field(min_items=1, max_items=5)
+    history_before: List[str] = Field(default_factory=list, max_items=100)
+    probabilities: Dict[str, float] = Field(default_factory=dict)
+    source: str = Field(default="client", max_length=20)
 
 
 class PredictionRequest(BaseModel):
@@ -444,26 +540,10 @@ def _farm_score_next_step(history_slice: List[str]) -> Dict[str, float]:
         p_t1 = (trans_1[item] + 1.5 * prior) / (total_trans_1 + 1.5) if total_trans_1 > 0 else empirical_bayes
         p_t2 = (trans_2[item] + 1.0 * prior) / (total_trans_2 + 1.0) if total_trans_2 > 0 else p_t1
 
-        if item in history_slice:
-            last_pos = len(history_slice) - 1 - history_slice[::-1].index(item)
-            gap = (n - 1) - last_pos
-        else:
-            gap = n + 1
-
-        overdue_ratio = gap / meta["expected_gap"]
-        overdue_multiplier = 1.0 + min(1.40, math.pow(overdue_ratio, 1.15) * 0.48)
-
-        recent_window = history_slice[-6:]
-        recent_share = recent_window.count(item) / len(recent_window)
-        saturation_factor = 0.62 if recent_share > (prior * 2.1) else 1.08
-
-        if item == last_1:
-            anti_copy_factor = 0.92 if observed_repeat_rate >= 0.30 else 0.48
-        else:
-            anti_copy_factor = 1.12
-
-        combined = (0.30 * empirical_bayes + 0.42 * p_t1 + 0.28 * p_t2)
-        raw_scores[item] = combined * overdue_multiplier * saturation_factor * anti_copy_factor
+        # لا نرفع احتمال العنصر لمجرد أنه غاب؛ ذلك مغالطة "المتأخر" إذا كانت الجولات مستقلة.
+        # نستخدم فقط التكرارات الفعلية والانتقالات المرصودة مع تنعيم يمنع تضخيم العينات الصغيرة.
+        combined = (0.40 * empirical_bayes + 0.35 * p_t1 + 0.25 * p_t2)
+        raw_scores[item] = combined
 
     total = sum(raw_scores.values()) or 1.0
     return {k: (v / total) * 100.0 for k, v in raw_scores.items()}
@@ -540,6 +620,11 @@ def run_farm_engine(clean_hist: List[str], min_sample: int) -> Dict[str, Any]:
         "measured_accuracy": round(hit_rate, 1) if backtest_trials > 0 else None,
         "baseline_accuracy": round(base_rate, 1) if backtest_trials > 0 else None,
         "top_coverage": round(top5_coverage, 1),
+        "farm_details": {
+            "top5": [name for name, _ in top5],
+            "probabilities": {name: round(float(prob_map[name]), 2) for name in FARM_CATALOG},
+            "sample_size": n,
+        },
     }
 
 
@@ -590,13 +675,7 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
         p1 = (trans_1[c] + 1.5 * base_equal_prob) / (t1_total + 1.5) if t1_total > 0 else emp
         p2 = (trans_2[c] + 1.0 * base_equal_prob) / (t2_total + 1.0) if t2_total > 0 else p1
 
-        if c in norm_hist:
-            gap = (n - 1) - (len(norm_hist) - 1 - norm_hist[::-1].index(c))
-        else:
-            gap = n
-
-        overdue_factor = 1.0 + min(0.32, (gap / 3.0) * 0.14)
-
+        # لا نكافئ الخانة لمجرد طول فترة غيابها؛ نحتفظ فقط بإشارات الانتقال المرصودة.
         if c == last_1:
             if rep_rate >= 0.36 or (t1_total > 0 and (trans_1[c] / t1_total) >= 0.38):
                 flow_factor = 1.06
@@ -607,7 +686,7 @@ def _poker_score_next_step(norm_hist: List[str]) -> Tuple[Dict[str, float], Dict
         else:
             flow_factor = 1.05 if switch_rate >= 0.65 else 0.98
 
-        scores[c] = (0.30 * emp + 0.45 * p1 + 0.25 * p2) * overdue_factor * flow_factor
+        scores[c] = (0.30 * emp + 0.45 * p1 + 0.25 * p2) * flow_factor
 
     total = sum(scores.values()) or 1.0
     prob_map = {c: (scores[c] / total) * 100.0 for c in chairs}
@@ -865,11 +944,9 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
             p2_tie = (trans_2[outcome] + 3.0 * prior_p) / (t2_total + 3.0) if t2_total > 0 else p1_tie
             base_tie = 0.40 * emp_tie + 0.35 * p1_tie + 0.25 * p2_tie
 
-            # إذا غاب التعادل أكثر من دورته المتوقعة (14 جولة) وكان له ظهور سابق، يرتفع وزنه بشكل معتدل
-            overdue_boost = 1.0 + min(0.30, max(0, tie_gap - 13) * 0.02)
-            # منع توقع تعادلين متتاليين إلا إذا تكرر ذلك فعلياً في السجل
+            # غياب التعادل وحده لا يزيد احتماله؛ نستخدم التكرارات والانتقالات الفعلية فقط.
             immediate_tie_mod = 0.78 if (last_1 == "🤝 تعادل" and trans_1["🤝 تعادل"] == 0) else 1.0
-            scores[outcome] = base_tie * overdue_boost * immediate_tie_mod
+            scores[outcome] = base_tie * immediate_tie_mod
         else:
             # حساب التنين والتايجر بدون أي انحياز مسبق لنسخ أو عكس النتيجة الأخيرة
             alpha_main = 6.0
@@ -916,7 +993,7 @@ def _dt_score_next_step(norm_hist: List[str]) -> Tuple[str, Dict[str, float], st
     # تحديد التوقع المستقبلي وسبب القرار بشفافية إحصائية
     if tie_prob >= 20.0 and tie_prob > max(d_prob, t_prob):
         predicted = "🤝 تعادل"
-        decision_reason = f"ارتفاع وزن التعادل إحصائياً ({tie_prob:.1f}%) بناءً على مصفوفة الانتقال وفجوة الغياب ({tie_gap} جولة)"
+        decision_reason = f"وزن التعادل المحسوب من التكرارات والانتقالات المرصودة ({tie_prob:.1f}%)؛ الغياب وحده لا يرفع الاحتمال"
     elif n < 2 or diff_dt < 0.35:
         # في حال تسجيل جولة واحدة فقط أو تساوي الكفتين تماماً، لا ننسخ ولا نعكس عشوائياً بل نعرض الأوزان المتقاربة بوضوح
         predicted = "🐉 تنين" if d_prob >= t_prob else "🐅 تايجر"
@@ -1384,6 +1461,103 @@ def reseller_create_key(req: ResellerKeyRequest, x_reseller_token: Optional[str]
         return {"ok": True, "key": item, "points": new_balance, "message": f"تم إنشاء الكود وخصم {cost} نقطة."}
 
 
+@app.post("/api/learning/outcome")
+async def record_learning_outcome(req: LearningOutcomeRequest, request: Request):
+    game = req.game_type.upper().strip()
+    if game not in {"DRAGON", "FARM", "POKER"}:
+        raise HTTPException(status_code=400, detail="نوع اللعبة غير مدعوم للتعلم.")
+    actual = normalize_item_name(req.actual)
+    predicted = [normalize_item_name(x) for x in req.predicted if x and x.strip()]
+    if not predicted:
+        raise HTTPException(status_code=400, detail="التوقع المسجل غير صالح.")
+    if game == "DRAGON":
+        actual = normalize_dt_outcome(actual)
+        predicted = [normalize_dt_outcome(x) for x in predicted]
+    elif game == "POKER":
+        actual = normalize_poker_outcome(actual)
+        predicted = [normalize_poker_outcome(x) for x in predicted]
+    else:
+        allowed = set(FARM_CATALOG)
+        if actual not in allowed or any(x not in allowed for x in predicted):
+            raise HTTPException(status_code=400, detail="نتيجة المزرعة غير معروفة.")
+    if not actual or any(not x for x in predicted):
+        raise HTTPException(status_code=400, detail="تعذر توحيد النتيجة أو التوقع.")
+
+    record = {
+        "id": uuid.uuid4().hex,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "game": game,
+        "room_id": (req.room_id or "default")[:100],
+        "actual": actual,
+        "predicted": predicted[:5],
+        "hit": actual in predicted,
+        "history_size": len(req.history_before),
+        "source": req.source,
+        "probabilities": {str(k)[:80]: max(0.0, min(100.0, float(v))) for k, v in list(req.probabilities.items())[:20] if isinstance(v, (int, float))},
+        "client_ip_hash": hashlib.sha256((request.client.host if request.client else "unknown").encode()).hexdigest()[:16],
+    }
+    with _learning_lock:
+        learning_store.setdefault("records", []).append(record)
+        learning_store["records"] = learning_store["records"][-10000:]
+        db_saved = _persist_learning_record(record)
+        # Keep a local fallback/cache too; without a volume this cache may reset on redeploy.
+        _save_learning_store(learning_store)
+    return {"ok": True, "recorded": True, "hit": record["hit"], "game": game,
+            "storage": "supabase" if db_saved else "local_fallback",
+            "durable_storage": bool(db_saved)}
+
+
+@app.get("/api/learning/stats")
+def learning_stats():
+    # Read the durable source on demand so records written by another worker/deployment are visible.
+    db_store = _load_learning_from_supabase()
+    with _learning_lock:
+        if db_store is not None:
+            learning_store["records"] = db_store.get("records", [])[-10000:]
+        records = list(learning_store.get("records", []))
+    games: Dict[str, Any] = {}
+    for game in ("DRAGON", "FARM", "POKER"):
+        rows = [r for r in records if r.get("game") == game]
+        out = {}
+        for window in (50, 100, 500):
+            recent = rows[-window:]
+            out[str(window)] = {
+                "trials": len(recent),
+                "hits": sum(1 for r in recent if r.get("hit")),
+                "accuracy": round(sum(1 for r in recent if r.get("hit")) / len(recent) * 100, 2) if recent else None,
+            }
+        metric = {"DRAGON": "إصابة توقع واحد", "FARM": "تغطية أفضل 5 عناصر", "POKER": "تغطية الخانتين الأولى والثانية"}[game]
+        games[game] = {"total": len(rows), "metric": metric, "windows": out}
+    durable = bool(SUPABASE_SERVICE_ROLE_KEY and db_store is not None)
+    return {"ok": True, "total_records": len(records), "games": games,
+            "storage": "supabase" if durable else "local_fallback",
+            "durable_storage": durable,
+            "note": "تعتمد الدقة على النتائج الفعلية التي تم إدخالها بعد التوقع؛ لا تمثل ضمانًا للنتيجة التالية. مقاييس الألعاب مختلفة ولا تُقارن مباشرةً."}
+
+
+def normalize_dt_outcome(raw: str) -> str:
+    s = str(raw or "").strip()
+    upper = s.upper()
+    if "تعادل" in s or "TIE" in upper or "🤝" in s:
+        return "🤝 تعادل"
+    if "تنين" in s or "DRAGON" in upper or "🐉" in s:
+        return "🐉 تنين"
+    if "تايجر" in s or "TIGER" in upper or "🐅" in s:
+        return "🐅 تايجر"
+    return ""
+
+
+def normalize_poker_outcome(raw: str) -> str:
+    s = str(raw or "").strip().upper()
+    if "A" in s or "كرسي A" in str(raw):
+        return "🟢 كرسي A"
+    if "B" in s or "كرسي B" in str(raw):
+        return "🔵 كرسي B"
+    if "C" in s or "كرسي C" in str(raw):
+        return "🔴 كرسي C"
+    return ""
+
+
 @app.post("/api/predict")
 async def predict_endpoint(req: PredictionRequest):
     lifecycle.total_requests += 1
@@ -1416,10 +1590,12 @@ async def predict_endpoint(req: PredictionRequest):
             min_s = lifecycle.config.min_sample_for_pattern
             poker_details = None
             dt_details = None
+            farm_details = None
 
             if "FARM" in game:
                 lifecycle.game_request_counts["FARM"] = lifecycle.game_request_counts.get("FARM", 0) + 1
                 res = run_farm_engine(clean_hist, min_s)
+                farm_details = res.get("farm_details")
             elif "POKER" in game:
                 lifecycle.game_request_counts["POKER"] = lifecycle.game_request_counts.get("POKER", 0) + 1
                 res = run_poker_engine(
@@ -1474,6 +1650,7 @@ async def predict_endpoint(req: PredictionRequest):
                 "baseline_accuracy": res["baseline_accuracy"],
                 "poker_details": poker_details,
                 "dt_details": dt_details,
+                "farm_details": farm_details,
                 "deduplicated": False,
             }
 
