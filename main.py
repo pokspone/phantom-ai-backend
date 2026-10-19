@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Learning Engine", version="120.9")
+app = FastAPI(title="Phantom Statistical & Learning Engine", version="121.0")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -1369,7 +1369,7 @@ def admin_telemetry_endpoint(x_admin_token: Optional[str] = Header(default=None)
 
 
 @app.post("/api/license/verify")
-def verify_license_proxy(req: LicenseVerifyRequest):
+def verify_license_proxy(req: LicenseVerifyRequest, request: Request):
     clean_code = req.key_code.strip().upper()
     encoded_code = urllib.parse.quote(clean_code)
     status_code, rows = supabase_server_request(
@@ -1379,69 +1379,100 @@ def verify_license_proxy(req: LicenseVerifyRequest):
 
     if status_code != 200 or not isinstance(rows, list):
         lifecycle.record_error_event("SUPABASE_VERIFY", f"Status {status_code} on key {clean_code}")
-        return {
-            "ok": False,
-            "error_type": "DB_QUERY_ERROR",
-            "message": "تعذر الوصول إلى جدول التراخيص في قاعدة البيانات.",
-        }
-
-    if len(rows) == 0:
-        return {
-            "ok": False,
-            "error_type": "KEY_NOT_FOUND",
-            "message": "❌ هذا المفتاح غير موجود في قاعدة البيانات!",
-        }
+        return {"ok": False, "error_type": "DB_QUERY_ERROR", "message": "تعذر الوصول إلى جدول التراخيص في قاعدة البيانات."}
+    if not rows:
+        return {"ok": False, "error_type": "KEY_NOT_FOUND", "message": "❌ هذا المفتاح غير موجود في قاعدة البيانات!"}
 
     record = rows[0]
     if record.get("status") == "banned":
-        return {
-            "ok": False,
-            "error_type": "KEY_BANNED",
-            "message": "🚫 هذا المفتاح محظور سحابياً وتم إيقافه!",
-        }
+        return {"ok": False, "error_type": "KEY_BANNED", "message": "🚫 هذا المفتاح محظور وتم إيقافه."}
 
-    bound_dev = record.get("bound_device")
-    if bound_dev and bound_dev != req.device_token:
-        return {
-            "ok": False,
-            "error_type": "DEVICE_MISMATCH",
-            "message": "🚨 هذا الكود مستخدم بالفعل على جهاز آخر ولا يمكن مشاركته!",
-        }
+    # Railway's proxy normally supplies X-Forwarded-For. Store it as a recovery/support hint,
+    # never as a standalone credential. The key itself is still required for recovery.
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = forwarded or (request.client.host if request.client else "unknown")
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat().replace("+00:00", "Z")
+    duration_mins = max(1, min(int(record.get("duration_minutes") or 60), 525600))
+    patch = {}
+
+    # Start the countdown only on the first successful activation, not when owner/reseller creates it.
+    activated_at = record.get("activated_at")
+    expires_at = record.get("expires_at")
+    if not activated_at or not expires_at:
+        activated_at = now_iso
+        expires_at = datetime.fromtimestamp(now_dt.timestamp() + duration_mins * 60, timezone.utc).isoformat().replace("+00:00", "Z")
+        patch.update({"activated_at": activated_at, "expires_at": expires_at, "last_ip": client_ip})
 
     try:
-        created_str = record.get("created_at", "")
-        created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-        created_ms = int(created_dt.timestamp() * 1000)
+        expiry_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        expiry_ms = int(expiry_dt.timestamp() * 1000)
     except Exception:
-        created_ms = int(time.time() * 1000)
+        # Legacy rows: preserve old created_at expiry only when activated_at columns were not migrated.
+        try:
+            created_dt = datetime.fromisoformat(str(record.get("created_at", "")).replace("Z", "+00:00"))
+            expiry_ms = int((created_dt.timestamp() + duration_mins * 60) * 1000)
+        except Exception:
+            return {"ok": False, "error_type": "DB_SCHEMA_ERROR", "message": "بيانات مدة الكود غير مكتملة. نفّذ تحديث SQL الخاص بالتراخيص."}
 
-    duration_mins = int(record.get("duration_minutes") or 60)
-    expiry_ms = created_ms + (duration_mins * 60 * 1000)
-    now_ms = int(time.time() * 1000)
-
+    now_ms = int(now_dt.timestamp() * 1000)
     if expiry_ms <= now_ms:
-        return {
-            "ok": False,
-            "error_type": "KEY_EXPIRED",
-            "message": "⚠️ هذا الكود انتهت صلاحيته الزمنية بالكامل!",
-        }
+        return {"ok": False, "error_type": "KEY_EXPIRED", "message": "⚠️ انتهت صلاحية الكود. يمكن للمالك إعادة تنشيطه من لوحة التحكم."}
 
-    if not bound_dev:
-        supabase_server_request(
-            f"licenses?key_code=eq.{encoded_code}",
-            "PATCH",
-            {"bound_device": req.device_token},
+    bound_dev = record.get("bound_device")
+    # If browser storage was cleared, allow recovery only with the same saved IP and the correct key.
+    # IP can be shared/dynamic, so it is a recovery aid, not proof of identity by itself.
+    if bound_dev and bound_dev != req.device_token:
+        previous_ip = record.get("last_ip")
+        if previous_ip and previous_ip == client_ip:
+            patch["bound_device"] = req.device_token
+            patch["last_ip"] = client_ip
+        else:
+            return {"ok": False, "error_type": "DEVICE_MISMATCH", "message": "هذا الكود مرتبط بجهاز آخر. لو فقدت بيانات المتصفح، استخدم نفس الشبكة أو تواصل مع المالك لإعادة التنشيط."}
+    elif not bound_dev:
+        patch["bound_device"] = req.device_token
+        patch["last_ip"] = client_ip
+    else:
+        # Refresh the IP for support/recovery when the same device returns.
+        patch["last_ip"] = client_ip
+
+    if patch:
+        patch_status, patch_result = supabase_server_request(
+            f"licenses?key_code=eq.{encoded_code}", "PATCH", patch
         )
+        if patch_status not in (200, 204):
+            lifecycle.record_error_event("LICENSE_ACTIVATE_SAVE", f"Status {patch_status} on key {clean_code}")
+            return {"ok": False, "error_type": "DB_WRITE_ERROR", "message": "تعذر حفظ تفعيل الكود في قاعدة البيانات. لم يتم بدء الجلسة."}
 
-    lifecycle.record_audit_event("LICENSE_VERIFIED", f"Key {clean_code} verified on device {req.device_token[:10]}")
+    lifecycle.record_audit_event("LICENSE_VERIFIED", f"Key {clean_code} verified; device={req.device_token[:10]}; ip_saved=yes")
     return {
-        "ok": True,
-        "error_type": None,
-        "key_code": clean_code,
-        "duration_minutes": duration_mins,
-        "expiry_ms": expiry_ms,
-        "remaining_minutes": round((expiry_ms - now_ms) / 60000.0, 2),
+        "ok": True, "error_type": None, "key_code": clean_code,
+        "duration_minutes": duration_mins, "activated_at": activated_at,
+        "expiry_ms": expiry_ms, "remaining_minutes": round((expiry_ms - now_ms) / 60000.0, 2),
     }
+
+
+@app.post("/api/license/{key_code}/activate")
+def reactivate_license(key_code: str, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    clean_code = key_code.strip().upper()
+    encoded_code = urllib.parse.quote(clean_code)
+    status_code, rows = supabase_server_request(
+        f"licenses?key_code=eq.{encoded_code}&select=key_code,status&limit=1", "GET"
+    )
+    if status_code != 200 or not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="تعذر الاتصال بجدول الأكواد في Supabase.")
+    if not rows:
+        raise HTTPException(status_code=404, detail="الكود غير موجود.")
+    patch_status, result = supabase_server_request(
+        f"licenses?key_code=eq.{encoded_code}", "PATCH",
+        {"status": "active", "activated_at": None, "expires_at": None,
+         "bound_device": None, "last_ip": None}
+    )
+    if patch_status not in (200, 204):
+        raise HTTPException(status_code=502, detail="تعذر إعادة تنشيط الكود؛ راجع أعمدة جدول licenses.")
+    lifecycle.record_audit_event("LICENSE_REACTIVATED", f"Key {clean_code} reset by admin; timer starts on next successful use")
+    return {"ok": True, "key_code": clean_code, "message": "تمت إعادة تنشيط الكود. يبدأ الوقت عند أول دخول ناجح بعد التنشيط."}
 
 
 @app.get("/api/health")
