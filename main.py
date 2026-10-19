@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import time
 import threading
@@ -30,12 +31,16 @@ logger = logging.getLogger("PhantomStatisticalServer")
 
 app = FastAPI(title="Phantom Statistical & Learning Engine", version="120.7")
 
+# Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
+# The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
+_cors_env = os.environ.get("PHANTOM_CORS_ORIGINS", "*").strip()
+_cors_origins = [origin.strip() for origin in _cors_env.split(",") if origin.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Admin-Token", "X-Reseller-Token", "Authorization", "apikey"],
 )
 
 STATE_FILE_PATH = os.environ.get("PHANTOM_STATE_FILE", "phantom_server_state.json")
@@ -47,6 +52,27 @@ LEARNING_FILE_PATH = os.environ.get("PHANTOM_LEARNING_FILE", "phantom_learning.j
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 LEARNING_TABLE = os.environ.get("PHANTOM_LEARNING_TABLE", "phantom_learning_records")
 _learning_lock = threading.RLock()
+_learning_rate_lock = threading.RLock()
+_learning_request_times: Dict[str, List[float]] = {}
+
+
+def _check_learning_rate_limit(client_ip: str, limit: int = 60, window_seconds: int = 60) -> Tuple[bool, int]:
+    """Lightweight per-process abuse guard for public client-reported outcomes."""
+    now = time.time()
+    with _learning_rate_lock:
+        recent = [stamp for stamp in _learning_request_times.get(client_ip, []) if now - stamp < window_seconds]
+        if len(recent) >= limit:
+            retry_after = max(1, int(window_seconds - (now - recent[0])))
+            _learning_request_times[client_ip] = recent
+            return False, retry_after
+        recent.append(now)
+        _learning_request_times[client_ip] = recent
+        # Bound memory if many unique addresses hit the endpoint.
+        if len(_learning_request_times) > 2000:
+            for key, stamps in list(_learning_request_times.items()):
+                if not stamps or now - stamps[-1] >= window_seconds:
+                    _learning_request_times.pop(key, None)
+        return True, 0
 
 
 def _learning_db_request(path: str, method: str = "GET", payload: Any = None) -> Tuple[int, Any]:
@@ -184,19 +210,19 @@ class LearningOutcomeRequest(BaseModel):
     game_type: str = Field(min_length=3, max_length=20)
     room_id: Optional[str] = Field(default="default", max_length=100)
     actual: str = Field(min_length=1, max_length=100)
-    predicted: List[str] = Field(min_items=1, max_items=5)
-    history_before: List[str] = Field(default_factory=list, max_items=100)
-    probabilities: Dict[str, float] = Field(default_factory=dict)
+    predicted: List[str] = Field(min_length=1, max_length=5)
+    history_before: List[str] = Field(default_factory=list, max_length=100)
+    probabilities: Dict[str, float] = Field(default_factory=dict, max_length=20)
     source: str = Field(default="client", max_length=20)
 
 
 class PredictionRequest(BaseModel):
-    game_type: str
-    room_id: Optional[str] = "default"
-    history: List[str] = []
-    coins: int = 0
-    client_hour: Optional[int] = None
-    client_minute: Optional[int] = None
+    game_type: str = Field(min_length=3, max_length=20)
+    room_id: Optional[str] = Field(default="default", max_length=100)
+    history: List[str] = Field(default_factory=list, max_length=100)
+    coins: int = Field(default=0, ge=0, le=1_000_000_000_000)
+    client_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    client_minute: Optional[int] = Field(default=None, ge=0, le=59)
     force_refresh: Optional[bool] = False
     poker_primary_ratio: Optional[float] = Field(default=0.65, ge=0.50, le=0.90)
     poker_alt_ratio: Optional[float] = Field(default=0.35, ge=0.10, le=0.50)
@@ -208,13 +234,16 @@ class PredictionRequest(BaseModel):
 
 def supabase_server_request(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
     url = f"{SUPABASE_URL}/rest/v1/{path}"
+    # Prefer the server-only service-role key for privileged license/admin operations.
+    # Never place this key in frontend HTML or return it from an API response.
+    db_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
     headers = {
-        "apikey": SUPABASE_KEY,
+        "apikey": db_key,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    if SUPABASE_KEY.startswith("eyJ"):
-        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if db_key.startswith("eyJ") or db_key == SUPABASE_SERVICE_ROLE_KEY and bool(SUPABASE_SERVICE_ROLE_KEY):
+        headers["Authorization"] = f"Bearer {db_key}"
     if method in ("POST", "PATCH"):
         headers["Prefer"] = "return=representation"
 
@@ -525,7 +554,7 @@ def _get_reseller_session(token: Optional[str]) -> Dict[str, Any]:
         raise HTTPException(status_code=403, detail="حساب الوكيل موقوف.")
     return reseller
 
-lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.6 initialized.")
+lifecycle.record_audit_event("SERVER_BOOT", "Phantom Statistical Server v120.7 initialized.")
 
 
 # =====================================================================
@@ -1329,7 +1358,7 @@ def health_check():
     return {
         "ok": True,
         "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.6",
+        "version": "120.7",
         "lifecycle": state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1517,6 +1546,10 @@ def reseller_create_key(req: ResellerKeyRequest, x_reseller_token: Optional[str]
 
 @app.post("/api/learning/outcome")
 async def record_learning_outcome(req: LearningOutcomeRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, retry_after = _check_learning_rate_limit(client_ip)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"تم تجاوز حد تسجيل النتائج. حاول بعد {retry_after} ثانية.")
     game = req.game_type.upper().strip()
     if game not in {"DRAGON", "FARM", "POKER"}:
         raise HTTPException(status_code=400, detail="نوع اللعبة غير مدعوم للتعلم.")
@@ -1546,8 +1579,8 @@ async def record_learning_outcome(req: LearningOutcomeRequest, request: Request)
         "predicted": predicted[:5],
         "hit": actual in predicted,
         "history_size": len(req.history_before),
-        "source": req.source,
-        "probabilities": {str(k)[:80]: max(0.0, min(100.0, float(v))) for k, v in list(req.probabilities.items())[:20] if isinstance(v, (int, float))},
+        "source": "client_reported",
+        "probabilities": {str(k)[:80]: max(0.0, min(100.0, float(v))) for k, v in list(req.probabilities.items())[:20] if isinstance(v, (int, float)) and math.isfinite(float(v))},
         "client_ip_hash": hashlib.sha256((request.client.host if request.client else "unknown").encode()).hexdigest()[:16],
     }
     with _learning_lock:
@@ -1602,14 +1635,25 @@ def normalize_dt_outcome(raw: str) -> str:
 
 
 def normalize_poker_outcome(raw: str) -> str:
-    s = str(raw or "").strip().upper()
-    if "A" in s or "كرسي A" in str(raw):
+    """Normalize explicit chair labels without matching letters inside other words.
+
+    The previous substring check treated ``Seat B`` as chair A because the word
+    ``SEAT`` contains the letter A. Only standalone chair tokens are accepted.
+    """
+    original = str(raw or "").strip()
+    upper = original.upper()
+    # Prefer explicit Arabic chair labels and emoji labels.
+    if "كرسي A" in upper or "🟢" in original:
         return "🟢 كرسي A"
-    if "B" in s or "كرسي B" in str(raw):
+    if "كرسي B" in upper or "🔵" in original:
         return "🔵 كرسي B"
-    if "C" in s or "كرسي C" in str(raw):
+    if "كرسي C" in upper or "🔴" in original:
         return "🔴 كرسي C"
-    return ""
+    # Accept common English forms (A / Seat A / Chair A), but not words like SEAT as A.
+    match = re.search(r"(?:^|[^A-Z])(?:SEAT|CHAIR)?\s*([ABC])(?:$|[^A-Z])", upper)
+    if not match:
+        return ""
+    return {"A": "🟢 كرسي A", "B": "🔵 كرسي B", "C": "🔴 كرسي C"}[match.group(1)]
 
 
 @app.post("/api/predict")
@@ -1725,7 +1769,7 @@ async def predict_endpoint(req: PredictionRequest):
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.6 Online",
+        "status": "Phantom Statistical & Lifecycle Server v120.7 Online",
         "endpoints": [
             "/api/predict",
             "/api/health",
