@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Learning Engine", version="121.2")
+app = FastAPI(title="Phantom Statistical & Learning Engine", version="122.0-social-api")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -2169,6 +2169,290 @@ async def predict_endpoint(req: PredictionRequest):
             raise HTTPException(status_code=500, detail=str(exc))
         finally:
             lifecycle.active_tasks -= 1
+
+
+# =====================================================================
+# PHANTOM ELITE NEW ACCOUNT / SOCIAL API (additive; legacy routes preserved)
+# Requires the approved phantom_platform_schema.sql and server-only
+# SUPABASE_SERVICE_ROLE_KEY configured in Railway environment variables.
+# =====================================================================
+
+class AccountSignupRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=30, pattern=r"^[A-Za-z0-9_.-]+$")
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: Optional[str] = Field(default="", max_length=60)
+
+class AccountLoginRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=60)
+    bio: Optional[str] = Field(default=None, max_length=300)
+    avatar_url: Optional[str] = Field(default=None, max_length=2048)
+
+class UserTargetRequest(BaseModel):
+    public_id: str = Field(min_length=4, max_length=40)
+
+class DirectMessageRequest(BaseModel):
+    receiver_public_id: str = Field(min_length=4, max_length=40)
+    body: str = Field(min_length=1, max_length=5000)
+
+class PresenceRequest(BaseModel):
+    is_online: bool = True
+
+
+def _auth_http(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
+               access_token: Optional[str] = None) -> Tuple[int, Any]:
+    """Call Supabase Auth without ever returning server secrets to clients."""
+    if not SUPABASE_KEY:
+        return 503, {"error": "SUPABASE_KEY is not configured"}
+    url = f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}"
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json", "Accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            raw = response.read().decode("utf-8")
+            return response.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try: body = json.loads(raw)
+        except Exception: body = {"error": raw[:1000]}
+        return exc.code, body
+    except Exception as exc:
+        logger.warning("Supabase Auth request failed: %s", exc)
+        return 503, {"error": "Supabase Auth is temporarily unavailable"}
+
+
+def _social_require_service_role() -> None:
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="يلزم ضبط SUPABASE_SERVICE_ROLE_KEY في إعدادات السيرفر قبل تشغيل نظام الحسابات.")
+
+
+def _social_current_user(authorization: Optional[str]) -> Dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="سجّل الدخول أولاً.")
+    token = authorization.split(" ", 1)[1].strip()
+    status, result = _auth_http("user", access_token=token)
+    if status != 200 or not isinstance(result, dict) or not result.get("id"):
+        raise HTTPException(status_code=401, detail="جلسة الدخول غير صالحة أو انتهت.")
+    return result
+
+
+def _social_db(path: str, method: str = "GET", payload: Any = None,
+               extra_headers: Optional[Dict[str, str]] = None) -> Tuple[int, Any]:
+    _social_require_service_role()
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    key = SUPABASE_SERVICE_ROLE_KEY
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Content-Type": "application/json", "Accept": "application/json"}
+    if method in ("POST", "PATCH", "DELETE"):
+        headers["Prefer"] = "return=representation"
+    if extra_headers: headers.update(extra_headers)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            raw = response.read().decode("utf-8")
+            return response.status, (json.loads(raw) if raw else [])
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        logger.warning("Social DB request failed (%s): %s", exc.code, raw[:500])
+        try: body = json.loads(raw)
+        except Exception: body = {"error": raw[:500]}
+        return exc.code, body
+    except Exception as exc:
+        logger.warning("Social DB request unavailable: %s", exc)
+        return 503, {"error": "Database is temporarily unavailable"}
+
+
+def _social_profile_by_user_id(user_id: str) -> Optional[Dict[str, Any]]:
+    status, data = _social_db("phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&user_id=eq." + urllib.parse.quote(user_id, safe=""))
+    if status != 200 or not isinstance(data, list) or not data:
+        return None
+    return data[0]
+
+
+def _social_profile_by_public_id(public_id: str) -> Optional[Dict[str, Any]]:
+    safe = urllib.parse.quote(public_id, safe="")
+    status, data = _social_db("phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&public_id=eq." + safe)
+    if status != 200 or not isinstance(data, list) or not data:
+        return None
+    return data[0]
+
+
+@app.post("/api/account/signup")
+def social_account_signup(req: AccountSignupRequest):
+    """Create an account through Supabase Auth; passwords are never stored in app tables."""
+    _social_require_service_role()
+    username = req.username.strip()
+    email = req.email.strip().lower()
+    status, existing = _social_db("phantom_profiles?select=user_id&username=ilike." + urllib.parse.quote(username, safe="") + "&limit=1")
+    if status == 200 and isinstance(existing, list) and existing:
+        raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
+    auth_status, auth_result = _auth_http("signup", method="POST", payload={"email": email, "password": req.password, "data": {"username": username}})
+    if auth_status not in (200, 201) or not isinstance(auth_result, dict):
+        message = auth_result.get("msg") or auth_result.get("message") or auth_result.get("error_description") or auth_result.get("error") or "تعذر إنشاء الحساب."
+        raise HTTPException(status_code=auth_status if 400 <= auth_status < 500 else 503, detail=str(message)[:300])
+    user = auth_result.get("user") or {}
+    user_id = user.get("id")
+    if not user_id:
+        # Email confirmation may be enabled, so Supabase may not issue a session yet.
+        raise HTTPException(status_code=202, detail="تم استلام طلب التسجيل. راجع إعدادات تأكيد البريد في Supabase لإكمال تسجيل الدخول.")
+    public_id = "PH" + secrets.token_hex(5).upper()
+    profile = {"user_id": user_id, "public_id": public_id, "username": username,
+               "display_name": (req.display_name or username).strip() or username}
+    db_status, db_result = _social_db("phantom_profiles", method="POST", payload=profile)
+    if db_status not in (200, 201):
+        logger.error("Account created in Auth but profile creation failed for %s: %s", user_id, db_result)
+        raise HTTPException(status_code=503, detail="تم إنشاء حساب الدخول لكن تعذر تجهيز الملف الشخصي. لا تكرر التسجيل؛ يلزم فحص إعداد قاعدة البيانات.")
+    _social_db("phantom_presence", method="POST", payload={"user_id": user_id, "is_online": True, "last_seen_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()})
+    return {"user": {"id": user_id, "public_id": public_id, "username": username, "display_name": profile["display_name"]},
+            "session": auth_result.get("session"), "message": "تم إنشاء الحساب."}
+
+
+@app.post("/api/account/login")
+def social_account_login(req: AccountLoginRequest):
+    status, result = _auth_http("token?grant_type=password", method="POST", payload={"email": req.email.strip().lower(), "password": req.password})
+    if status != 200 or not isinstance(result, dict) or not result.get("access_token"):
+        message = result.get("msg") or result.get("message") or result.get("error_description") or result.get("error") or "بيانات تسجيل الدخول غير صحيحة."
+        raise HTTPException(status_code=401 if status in (400, 401, 422) else 503, detail=str(message)[:300])
+    user = result.get("user") or {}
+    profile = _social_profile_by_user_id(str(user.get("id", "")))
+    if not profile:
+        raise HTTPException(status_code=403, detail="الحساب لا يحتوي على ملف PHANTOM ELITE الشخصي بعد. تواصل مع الإدارة.")
+    now = datetime.now(timezone.utc).isoformat()
+    _social_db("phantom_presence?user_id=eq." + urllib.parse.quote(profile["user_id"], safe=""), method="PATCH", payload={"is_online": True, "last_seen_at": now, "updated_at": now})
+    return {"session": result, "profile": profile}
+
+
+@app.get("/api/account/me")
+def social_account_me(authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    profile = _social_profile_by_user_id(str(user["id"]))
+    if not profile: raise HTTPException(status_code=404, detail="الملف الشخصي غير موجود.")
+    return {"profile": profile, "email": user.get("email")}
+
+
+@app.patch("/api/account/profile")
+def social_account_update_profile(req: ProfileUpdateRequest, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    changes = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    if "avatar_url" in changes and changes["avatar_url"] and not changes["avatar_url"].startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="رابط الصورة يجب أن يبدأ بـ http:// أو https://")
+    if not changes: raise HTTPException(status_code=400, detail="لا توجد تغييرات.")
+    changes["updated_at"] = datetime.now(timezone.utc).isoformat()
+    status, result = _social_db("phantom_profiles?user_id=eq." + urllib.parse.quote(str(user["id"]), safe=""), method="PATCH", payload=changes)
+    if status not in (200, 204): raise HTTPException(status_code=503, detail="تعذر تحديث الملف الشخصي.")
+    return {"profile": result[0] if isinstance(result, list) and result else _social_profile_by_user_id(str(user["id"]))}
+
+
+@app.get("/api/social/users")
+def social_search_users(q: str = "", limit: int = 20, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    limit = max(1, min(limit, 50))
+    query = urllib.parse.quote((q or "").strip(), safe="")
+    path = "phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&order=created_at.desc&limit=" + str(limit)
+    if q.strip(): path += "&or=(username.ilike.*" + query + "*,display_name.ilike.*" + query + "*,public_id.ilike.*" + query + "*)"
+    status, profiles = _social_db(path)
+    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل المستخدمين.")
+    return {"users": [p for p in profiles if p.get("user_id") != user["id"]] if isinstance(profiles, list) else []}
+
+
+@app.post("/api/social/friend-requests")
+def social_send_friend_request(req: UserTargetRequest, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    target = _social_profile_by_public_id(req.public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك إضافة نفسك.")
+    status, result = _social_db("phantom_friend_requests", method="POST", payload={"sender_id": user["id"], "receiver_id": target["user_id"]})
+    if status not in (200, 201): raise HTTPException(status_code=409, detail="تعذر إرسال الطلب؛ قد يوجد طلب سابق بين الحسابين.")
+    return {"request": result[0] if isinstance(result, list) and result else result}
+
+
+@app.get("/api/social/friend-requests")
+def social_list_friend_requests(authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    uid = urllib.parse.quote(str(user["id"]), safe="")
+    status, result = _social_db("phantom_friend_requests?select=*&or=(sender_id.eq." + uid + ",receiver_id.eq." + uid + ")&order=created_at.desc&limit=100")
+    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل طلبات الصداقة.")
+    return {"requests": result if isinstance(result, list) else []}
+
+
+@app.post("/api/social/follow")
+def social_follow(req: UserTargetRequest, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    target = _social_profile_by_public_id(req.public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك متابعة نفسك.")
+    status, result = _social_db("phantom_follows", method="POST", payload={"follower_id": user["id"], "followed_id": target["user_id"]})
+    if status not in (200, 201): raise HTTPException(status_code=409, detail="أنت تتابع هذا المستخدم بالفعل أو تعذر تنفيذ الطلب.")
+    return {"success": True}
+
+
+@app.delete("/api/social/follow/{public_id}")
+def social_unfollow(public_id: str, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    target = _social_profile_by_public_id(public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    status, result = _social_db("phantom_follows?follower_id=eq." + urllib.parse.quote(str(user["id"]), safe="") + "&followed_id=eq." + urllib.parse.quote(str(target["user_id"]), safe=""), method="DELETE")
+    if status not in (200, 204): raise HTTPException(status_code=503, detail="تعذر إلغاء المتابعة.")
+    return {"success": True}
+
+
+@app.post("/api/social/messages")
+def social_send_message(req: DirectMessageRequest, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    target = _social_profile_by_public_id(req.receiver_public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستلم غير موجود.")
+    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك مراسلة نفسك.")
+    status, result = _social_db("phantom_messages", method="POST", payload={"sender_id": user["id"], "receiver_id": target["user_id"], "body": req.body.strip()})
+    if status not in (200, 201): raise HTTPException(status_code=503, detail="تعذر إرسال الرسالة.")
+    return {"message": result[0] if isinstance(result, list) and result else result}
+
+
+@app.get("/api/social/messages/{public_id}")
+def social_get_messages(public_id: str, limit: int = 50, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    target = _social_profile_by_public_id(public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    limit = max(1, min(limit, 100))
+    uid, tid = urllib.parse.quote(str(user["id"]), safe=""), urllib.parse.quote(str(target["user_id"]), safe="")
+    path = "phantom_messages?select=id,sender_id,receiver_id,body,created_at,read_at&or=(and(sender_id.eq." + uid + ",receiver_id.eq." + tid + "),and(sender_id.eq." + tid + ",receiver_id.eq." + uid + "))&order=created_at.desc&limit=" + str(limit)
+    status, result = _social_db(path)
+    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل المحادثة.")
+    return {"messages": list(reversed(result)) if isinstance(result, list) else []}
+
+
+@app.post("/api/social/presence")
+def social_update_presence(req: PresenceRequest, authorization: Optional[str] = Header(default=None)):
+    user = _social_current_user(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    uid = urllib.parse.quote(str(user["id"]), safe="")
+    payload = {"user_id": user["id"], "is_online": req.is_online, "last_seen_at": now, "updated_at": now}
+    status, result = _social_db("phantom_presence?on_conflict=user_id", method="POST", payload=payload,
+                                extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"})
+    if status not in (200, 201):
+        # If the upsert preference is unsupported, try an update then insert.
+        status2, _ = _social_db("phantom_presence?user_id=eq." + uid, method="PATCH", payload={"is_online": req.is_online, "last_seen_at": now, "updated_at": now})
+        if status2 not in (200, 204): raise HTTPException(status_code=503, detail="تعذر تحديث حالة الاتصال.")
+    return {"success": True, "is_online": req.is_online, "last_seen_at": now}
+
+
+@app.get("/api/social/presence/{public_id}")
+def social_get_presence(public_id: str, authorization: Optional[str] = Header(default=None)):
+    _social_current_user(authorization)
+    target = _social_profile_by_public_id(public_id.strip())
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    uid = urllib.parse.quote(str(target["user_id"]), safe="")
+    status, result = _social_db("phantom_presence?select=is_online,last_seen_at,updated_at&user_id=eq." + uid)
+    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل حالة الاتصال.")
+    return {"presence": result[0] if isinstance(result, list) and result else {"is_online": False, "last_seen_at": None}}
+
 
 
 @app.get("/")
