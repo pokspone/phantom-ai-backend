@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import hashlib
 import json
@@ -30,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="Phantom Statistical & Learning Engine", version="122.0-social-api")
+app = FastAPI(title="PHANTOM ELITE Platform & Farm Engine", version="122.0")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -1532,13 +1533,16 @@ def reactivate_license(key_code: str, x_admin_token: Optional[str] = Header(defa
 def health_check():
     state = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=False)
     reseller_db_check = "not_configured"
+    platform_db_check = "not_configured"
     if SUPABASE_SERVICE_ROLE_KEY:
         db_status, db_rows = _learning_db_request(f"{RESELLER_TABLE}?select=id&limit=1")
         reseller_db_check = "connected" if db_status == 200 and isinstance(db_rows, list) else f"error_{db_status}"
+        platform_status, platform_rows = _learning_db_request(f"{PLATFORM_TABLE}?select=id&limit=1")
+        platform_db_check = "connected" if platform_status == 200 and isinstance(platform_rows, list) else f"error_{platform_status}"
     return {
         "ok": True,
-        "service": "Phantom Statistical & Lifecycle Server",
-        "version": "120.9",
+        "service": "PHANTOM ELITE Platform & Farm Engine",
+        "version": "122.0",
         "lifecycle": state,
         "storage": {
             "mode": "supabase_reseller_state" if SUPABASE_SERVICE_ROLE_KEY else ("railway_volume" if os.path.ismount("/data") else "local_ephemeral"),
@@ -1546,6 +1550,9 @@ def health_check():
             "reseller_durable_storage_configured": bool(SUPABASE_SERVICE_ROLE_KEY),
             "reseller_database_connection": reseller_db_check,
             "reseller_table": RESELLER_TABLE if SUPABASE_SERVICE_ROLE_KEY else None,
+            "platform_table": PLATFORM_TABLE if SUPABASE_SERVICE_ROLE_KEY else None,
+            "platform_database_connection": platform_db_check,
+            "platform_durable_storage_configured": bool(SUPABASE_SERVICE_ROLE_KEY),
             "state_path": STATE_FILE_PATH,
             "reseller_path": RESELLER_STATE_FILE,
             "learning_path": LEARNING_FILE_PATH,
@@ -2062,11 +2069,15 @@ def normalize_poker_outcome(raw: str) -> str:
 
 
 @app.post("/api/predict")
-async def predict_endpoint(req: PredictionRequest):
+async def predict_endpoint(req: PredictionRequest, authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
     lifecycle.total_requests += 1
     state_meta = lifecycle.evaluate_lifecycle_state(is_incoming_prediction=True)
 
     game = req.game_type.upper().strip()
+    if "FARM" not in game:
+        raise HTTPException(status_code=410, detail="تم إيقاف محركات Dragon Tiger والبوكر. PHANTOM ELITE يدعم توقع المزرعة فقط.")
+    game = "FARM"
     clean_hist = [normalize_item_name(h) for h in req.history if h and h.strip()]
     room_key = f"{game}:{req.room_id or 'default'}"
 
@@ -2172,331 +2183,691 @@ async def predict_endpoint(req: PredictionRequest):
 
 
 # =====================================================================
-# PHANTOM ELITE NEW ACCOUNT / SOCIAL API (additive; legacy routes preserved)
-# Requires the approved phantom_platform_schema.sql and server-only
-# SUPABASE_SERVICE_ROLE_KEY configured in Railway environment variables.
+# PHANTOM ELITE PLATFORM API — accounts, social feed, chat, VIP and admin
 # =====================================================================
-
-class AccountSignupRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=30, pattern=r"^[A-Za-z0-9_.-]+$")
-    email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=8, max_length=128)
-    display_name: Optional[str] = Field(default="", max_length=60)
-
-class AccountLoginRequest(BaseModel):
-    email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=1, max_length=128)
-
-class ProfileUpdateRequest(BaseModel):
-    display_name: Optional[str] = Field(default=None, max_length=60)
-    bio: Optional[str] = Field(default=None, max_length=300)
-    avatar_url: Optional[str] = Field(default=None, max_length=2048)
-
-class UserTargetRequest(BaseModel):
-    public_id: str = Field(min_length=4, max_length=40)
-
-class DirectMessageRequest(BaseModel):
-    receiver_public_id: str = Field(min_length=4, max_length=40)
-    body: str = Field(min_length=1, max_length=5000)
-
-class PresenceRequest(BaseModel):
-    is_online: bool = True
+PLATFORM_TABLE = os.environ.get("PHANTOM_PLATFORM_TABLE", "phantom_platform_state").strip()
+PLATFORM_FILE_PATH = _storage_path("PHANTOM_PLATFORM_FILE", "phantom_platform_state.json")
+_platform_lock = threading.RLock()
 
 
-def _auth_http(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
-               access_token: Optional[str] = None) -> Tuple[int, Any]:
-    """Call Supabase Auth without ever returning server secrets to clients."""
-    if not SUPABASE_KEY:
-        return 503, {"error": "SUPABASE_KEY is not configured"}
-    url = f"{SUPABASE_URL}/auth/v1/{path.lstrip('/')}"
-    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json", "Accept": "application/json"}
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+def _platform_default_state() -> Dict[str, Any]:
+    return {
+        "users": {}, "sessions": {}, "moments": [], "messages": [], "reports": [], "predictions": [],
+        "announcements": [], "featured_user_ids": [], "audit": [],
+        "apps": [
+            {"id": "toptop", "name": "TopTop", "active": True, "engine": "FARM"},
+            {"id": "xena", "name": "Xena", "active": True, "engine": "FARM"},
+            {"id": "hifami", "name": "Hi fami", "active": True, "engine": "FARM"},
+            {"id": "mico", "name": "Mico", "active": True, "engine": "FARM"},
+            {"id": "helloyo", "name": "Hello Yo", "active": True, "engine": "FARM"},
+            {"id": "taka", "name": "Taka", "active": True, "engine": "FARM"},
+            {"id": "soyo", "name": "SOYO", "active": True, "engine": "FARM"},
+            {"id": "sugu", "name": "SUGU", "active": True, "engine": "FARM"},
+            {"id": "4funlite", "name": "4Fun Lite", "active": True, "engine": "FARM"},
+        ],
+        "settings": {"app_name": "BOOM - PREMIUM QUILT EDITION", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "chat_enabled": True, "moments_enabled": True},
+    }
+
+
+def _platform_load_state() -> Dict[str, Any]:
+    if SUPABASE_SERVICE_ROLE_KEY:
+        status, rows = _learning_db_request(f"{PLATFORM_TABLE}?id=eq.primary&select=state&limit=1")
+        if status == 200 and isinstance(rows, list):
+            if rows and isinstance(rows[0].get("state"), dict):
+                return rows[0]["state"]
+            return _platform_default_state()
+        logger.error("Platform state table unavailable (HTTP %s); platform writes will be blocked until SQL setup", status)
     try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read().decode("utf-8")
-            return response.status, (json.loads(raw) if raw else {})
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try: body = json.loads(raw)
-        except Exception: body = {"error": raw[:1000]}
-        return exc.code, body
+        if os.path.exists(PLATFORM_FILE_PATH):
+            with open(PLATFORM_FILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                default = _platform_default_state()
+                default.update(data)
+                return default
     except Exception as exc:
-        logger.warning("Supabase Auth request failed: %s", exc)
-        return 503, {"error": "Supabase Auth is temporarily unavailable"}
+        logger.warning("Platform state file could not be loaded: %s", exc)
+    return _platform_default_state()
 
 
-def _social_require_service_role() -> None:
+platform_state = _platform_load_state()
+_platform_last_saved_state = copy.deepcopy(platform_state)
+
+
+def _platform_save_state() -> None:
+    global _platform_last_saved_state
+    snapshot = copy.deepcopy(platform_state)
+    if SUPABASE_SERVICE_ROLE_KEY:
+        url = f"{SUPABASE_URL}/rest/v1/{PLATFORM_TABLE}?on_conflict=id"
+        headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                   "Content-Type": "application/json", "Accept": "application/json",
+                   "Prefer": "resolution=merge-duplicates,return=minimal"}
+        payload = [{"id": "primary", "state": snapshot, "updated_at": datetime.now(timezone.utc).isoformat()}]
+        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status not in (200, 201, 204):
+                    raise RuntimeError(f"HTTP {resp.status}")
+            _platform_last_saved_state = copy.deepcopy(snapshot)
+            return
+        except Exception as exc:
+            logger.error("Platform durable save failed: %s", exc)
+            platform_state.clear(); platform_state.update(copy.deepcopy(_platform_last_saved_state))
+            raise HTTPException(status_code=503, detail="تعذر حفظ التغيير في قاعدة البيانات الدائمة. راجع جدول المنصة وإعدادات Supabase.")
+    try:
+        parent = os.path.dirname(os.path.abspath(PLATFORM_FILE_PATH))
+        os.makedirs(parent, exist_ok=True)
+        tmp = PLATFORM_FILE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, PLATFORM_FILE_PATH)
+        _platform_last_saved_state = copy.deepcopy(snapshot)
+    except Exception as exc:
+        logger.error("Platform local save failed: %s", exc)
+        platform_state.clear(); platform_state.update(copy.deepcopy(_platform_last_saved_state))
+        raise HTTPException(status_code=500, detail="تعذر حفظ بيانات المنصة محليًا.")
+
+
+def _platform_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
+    vip = user.get("vip") or {}
+    active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+    return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "username": user.get("username"), "role": user.get("role", "USER"),
+            "profile": user.get("profile", {}), "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip},
+            "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned"))}
+
+
+def _platform_password_hash(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 310000).hex()
+    return salt, digest
+
+
+def _platform_find_session(authorization: Optional[str]) -> Dict[str, Any]:
+    token = (authorization or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="سجّل الدخول أولًا.")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with _platform_lock:
+        session = platform_state.get("sessions", {}).get(token_hash)
+        if not session or float(session.get("expires", 0)) <= time.time():
+            platform_state.get("sessions", {}).pop(token_hash, None)
+            raise HTTPException(status_code=401, detail="انتهت الجلسة؛ سجّل الدخول مرة أخرى.")
+        user = platform_state.get("users", {}).get(session.get("user_key"))
+        if not user or user.get("banned"):
+            raise HTTPException(status_code=403, detail="الحساب غير متاح أو موقوف.")
+        user["last_active"] = _platform_now()
+        return user
+
+
+def _platform_require_admin(authorization: Optional[str], allow_moderator: bool = False) -> Dict[str, Any]:
+    token = (authorization or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    # The existing server-authenticated owner session is also allowed to administer platform data.
+    if token:
+        try:
+            _require_admin(token)
+            return {"id": "SERVER-OWNER", "username": "PHANTOM OWNER", "role": "OWNER"}
+        except HTTPException:
+            pass
+    user = _platform_find_session(authorization)
+    allowed = {"OWNER", "ADMIN"} | ({"MODERATOR"} if allow_moderator else set())
+    if user.get("role") not in allowed:
+        raise HTTPException(status_code=403, detail="هذه العملية تتطلب صلاحية إدارية.")
+    return user
+
+
+def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail: str = "") -> None:
+    platform_state.setdefault("audit", []).append({"id": secrets.token_hex(8), "actor_id": actor.get("id"),
+        "actor_username": actor.get("username"), "action": action, "target": target, "detail": detail[:500], "at": _platform_now()})
+    platform_state["audit"] = platform_state["audit"][-2000:]
+
+
+@app.get("/api/platform/release")
+def platform_release_info():
+    return {"app": "BOOM - PREMIUM QUILT EDITION", "release": "v123", "prediction_engine": "FARM_ONLY", "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+
+
+@app.post("/api/platform/auth/signup")
+def platform_signup(payload: Dict[str, Any]):
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    confirm = str(payload.get("confirm_password", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,24}", username):
+        raise HTTPException(status_code=400, detail="اسم المستخدم يجب أن يكون 3–24 حرفًا إنجليزيًا أو رقمًا أو . _ -")
+    if len(password) < 8 or len(password) > 128:
+        raise HTTPException(status_code=400, detail="كلمة المرور يجب ألا تقل عن 8 أحرف.")
+    if password != confirm:
+        raise HTTPException(status_code=400, detail="كلمتا المرور غير متطابقتين.")
+    key = username.casefold()
+    with _platform_lock:
+        if key in platform_state["users"]:
+            raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
+        salt, digest = _platform_password_hash(password)
+        user_id = "PH-" + secrets.token_hex(4).upper()
+        while any(u.get("id") == user_id for u in platform_state["users"].values()):
+            user_id = "PH-" + secrets.token_hex(4).upper()
+        owner_name = os.environ.get("PHANTOM_OWNER_USERNAME", "").strip().casefold()
+        role = "OWNER" if owner_name and key == owner_name else "USER"
+        user = {"id": user_id, "display_id": user_id, "username": username, "password_salt": salt, "password_hash": digest, "role": role,
+                "profile": {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": ""},
+                "badges": ([{"name": "App Owner", "rarity": "legendary"}] if role == "OWNER" else []),
+                "vip": {"active": False, "plan_days": 0, "started_at": None, "expires_at": None},
+                "created_at": _platform_now(), "last_active": _platform_now(), "banned": False, "blocked_users": []}
+        platform_state["users"][key] = user
+        token = secrets.token_urlsafe(40)
+        platform_state.setdefault("sessions", {})[hashlib.sha256(token.encode()).hexdigest()] = {"user_key": key, "expires": time.time() + 7 * 86400, "created_at": _platform_now()}
+        _platform_audit(user, "USER_SIGNUP", user_id)
+        _platform_save_state()
+    return {"ok": True, "token": token, "user": _platform_user_public(user), "expires_in": 604800}
+
+
+@app.post("/api/platform/auth/login")
+def platform_login(payload: Dict[str, Any]):
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    key = username.casefold()
+    with _platform_lock:
+        user = platform_state.get("users", {}).get(key)
+        if not user:
+            raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة.")
+        _, digest = _platform_password_hash(password, user.get("password_salt", ""))
+        if not hmac.compare_digest(digest, str(user.get("password_hash", ""))):
+            raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة.")
+        if user.get("banned"):
+            raise HTTPException(status_code=403, detail="الحساب موقوف؛ تواصل مع الدعم.")
+        token = secrets.token_urlsafe(40)
+        platform_state.setdefault("sessions", {})[hashlib.sha256(token.encode()).hexdigest()] = {"user_key": key, "expires": time.time() + 7 * 86400, "created_at": _platform_now()}
+        user["last_active"] = _platform_now()
+        _platform_save_state()
+    return {"ok": True, "token": token, "user": _platform_user_public(user), "expires_in": 604800}
+
+
+@app.post("/api/platform/auth/logout")
+def platform_logout(authorization: Optional[str] = Header(default=None)):
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if token:
+        with _platform_lock:
+            platform_state.get("sessions", {}).pop(hashlib.sha256(token.encode()).hexdigest(), None)
+            _platform_save_state()
+    return {"ok": True}
+
+
+@app.get("/api/platform/me")
+def platform_me(authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    return {"ok": True, "user": _platform_user_public(user), "settings": platform_state.get("settings", {})}
+
+
+@app.post("/api/platform/media/upload")
+def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    data_url = str(payload.get("data_url", ""))
+    match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", data_url)
+    if not match: raise HTTPException(status_code=400, detail="صيغة الصورة غير مدعومة. استخدم JPG أو PNG أو WEBP أو GIF.")
+    mime, encoded = match.groups()
+    try: raw = base64.b64decode(encoded, validate=True)
+    except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
+    if not raw or len(raw) > 950 * 1024: raise HTTPException(status_code=413, detail="حجم الصورة يجب ألا يتجاوز 950 كيلوبايت.")
     if not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=503, detail="يلزم ضبط SUPABASE_SERVICE_ROLE_KEY في إعدادات السيرفر قبل تشغيل نظام الحسابات.")
-
-
-def _social_current_user(authorization: Optional[str]) -> Dict[str, Any]:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="سجّل الدخول أولاً.")
-    token = authorization.split(" ", 1)[1].strip()
-    status, result = _auth_http("user", access_token=token)
-    if status != 200 or not isinstance(result, dict) or not result.get("id"):
-        raise HTTPException(status_code=401, detail="جلسة الدخول غير صالحة أو انتهت.")
-    return result
-
-
-def _social_db(path: str, method: str = "GET", payload: Any = None,
-               extra_headers: Optional[Dict[str, str]] = None) -> Tuple[int, Any]:
-    _social_require_service_role()
-    url = f"{SUPABASE_URL}/rest/v1/{path}"
-    key = SUPABASE_SERVICE_ROLE_KEY
-    headers = {"apikey": key, "Authorization": f"Bearer {key}",
-               "Content-Type": "application/json", "Accept": "application/json"}
-    if method in ("POST", "PATCH", "DELETE"):
-        headers["Prefer"] = "return=representation"
-    if extra_headers: headers.update(extra_headers)
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # Development fallback only; configure Supabase Storage for durable hosted media.
+        return {"ok": True, "url": data_url, "storage": "inline_local_fallback"}
+    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}[mime]
+    object_path = f"users/{user.get('id')}/{secrets.token_hex(12)}.{extension}"
+    url = f"{SUPABASE_URL}/storage/v1/object/phantom-media/{object_path}"
+    headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+               "Content-Type": mime, "x-upsert": "false"}
+    req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read().decode("utf-8")
-            return response.status, (json.loads(raw) if raw else [])
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status not in (200, 201): raise RuntimeError(f"Storage HTTP {resp.status}")
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/phantom-media/{object_path}"
+        return {"ok": True, "url": public_url, "storage": "supabase_storage"}
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        logger.warning("Social DB request failed (%s): %s", exc.code, raw[:500])
-        try: body = json.loads(raw)
-        except Exception: body = {"error": raw[:500]}
-        return exc.code, body
+        detail = exc.read().decode("utf-8", errors="ignore")[:400]
+        logger.error("Platform media upload failed: %s", detail)
+        raise HTTPException(status_code=502, detail="تعذر رفع الصورة إلى Supabase Storage. تأكد من إنشاء bucket باسم phantom-media.")
     except Exception as exc:
-        logger.warning("Social DB request unavailable: %s", exc)
-        return 503, {"error": "Database is temporarily unavailable"}
+        logger.error("Platform media upload failed: %s", exc)
+        raise HTTPException(status_code=502, detail="فشل رفع الصورة إلى التخزين الدائم.")
 
 
-def _social_profile_by_user_id(user_id: str) -> Optional[Dict[str, Any]]:
-    status, data = _social_db("phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&user_id=eq." + urllib.parse.quote(user_id, safe=""))
-    if status != 200 or not isinstance(data, list) or not data:
-        return None
-    return data[0]
+@app.patch("/api/platform/profile")
+def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    allowed = {"display_name", "bio", "avatar", "banner", "city", "governorate", "relationship"}
+    profile = user.setdefault("profile", {})
+    for field in allowed:
+        if field in payload:
+            value = str(payload[field] or "").strip()
+            if field in {"avatar", "banner"} and len(value) > 1_500_000:
+                raise HTTPException(status_code=413, detail="الصورة كبيرة جدًا؛ الحد الأقصى 1.5 ميجابايت.")
+            if field not in {"avatar", "banner"} and len(value) > 500:
+                raise HTTPException(status_code=400, detail=f"القيمة طويلة جدًا للحقل {field}.")
+            profile[field] = value
+    with _platform_lock:
+        _platform_save_state()
+    return {"ok": True, "user": _platform_user_public(user)}
 
 
-def _social_profile_by_public_id(public_id: str) -> Optional[Dict[str, Any]]:
-    safe = urllib.parse.quote(public_id, safe="")
-    status, data = _social_db("phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&public_id=eq." + safe)
-    if status != 200 or not isinstance(data, list) or not data:
-        return None
-    return data[0]
+@app.get("/api/platform/users")
+def platform_users(q: str = "", authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    q = q.strip().casefold()
+    with _platform_lock:
+        values = [_platform_user_public(u) for u in platform_state.get("users", {}).values()
+                  if (not q or q in str(u.get("username", "")).casefold() or q in str(u.get("id", "")).casefold()) and not u.get("banned")]
+        values.sort(key=lambda u: (u.get("id") != next((x.get("id") for x in platform_state["users"].values() if x.get("role") == "OWNER"), None), u.get("username", "").casefold()))
+        featured = platform_state.get("featured_user_ids", [])
+        values.sort(key=lambda u: (u.get("role") != "OWNER", u.get("id") not in featured, u.get("username", "").casefold()))
+        return {"ok": True, "users": values[:100], "featured_user_ids": featured}
 
 
-@app.post("/api/account/signup")
-def social_account_signup(req: AccountSignupRequest):
-    """Create an account through Supabase Auth; passwords are never stored in app tables."""
-    _social_require_service_role()
-    username = req.username.strip()
-    email = req.email.strip().lower()
-    status, existing = _social_db("phantom_profiles?select=user_id&username=ilike." + urllib.parse.quote(username, safe="") + "&limit=1")
-    if status == 200 and isinstance(existing, list) and existing:
-        raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
-    auth_status, auth_result = _auth_http("signup", method="POST", payload={"email": email, "password": req.password, "data": {"username": username}})
-    if auth_status not in (200, 201) or not isinstance(auth_result, dict):
-        message = auth_result.get("msg") or auth_result.get("message") or auth_result.get("error_description") or auth_result.get("error") or "تعذر إنشاء الحساب."
-        raise HTTPException(status_code=auth_status if 400 <= auth_status < 500 else 503, detail=str(message)[:300])
-    user = auth_result.get("user") or {}
-    user_id = user.get("id")
-    if not user_id:
-        # Email confirmation may be enabled, so Supabase may not issue a session yet.
-        raise HTTPException(status_code=202, detail="تم استلام طلب التسجيل. راجع إعدادات تأكيد البريد في Supabase لإكمال تسجيل الدخول.")
-    public_id = "PH" + secrets.token_hex(5).upper()
-    profile = {"user_id": user_id, "public_id": public_id, "username": username,
-               "display_name": (req.display_name or username).strip() or username}
-    db_status, db_result = _social_db("phantom_profiles", method="POST", payload=profile)
-    if db_status not in (200, 201):
-        logger.error("Account created in Auth but profile creation failed for %s: %s", user_id, db_result)
-        raise HTTPException(status_code=503, detail="تم إنشاء حساب الدخول لكن تعذر تجهيز الملف الشخصي. لا تكرر التسجيل؛ يلزم فحص إعداد قاعدة البيانات.")
-    _social_db("phantom_presence", method="POST", payload={"user_id": user_id, "is_online": True, "last_seen_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()})
-    return {"user": {"id": user_id, "public_id": public_id, "username": username, "display_name": profile["display_name"]},
-            "session": auth_result.get("session"), "message": "تم إنشاء الحساب."}
+@app.get("/api/platform/apps")
+def platform_apps(authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
+    return {"ok": True, "apps": platform_state.get("apps", []), "engine": "FARM"}
 
 
-@app.post("/api/account/login")
-def social_account_login(req: AccountLoginRequest):
-    status, result = _auth_http("token?grant_type=password", method="POST", payload={"email": req.email.strip().lower(), "password": req.password})
-    if status != 200 or not isinstance(result, dict) or not result.get("access_token"):
-        message = result.get("msg") or result.get("message") or result.get("error_description") or result.get("error") or "بيانات تسجيل الدخول غير صحيحة."
-        raise HTTPException(status_code=401 if status in (400, 401, 422) else 503, detail=str(message)[:300])
-    user = result.get("user") or {}
-    user_id = str(user.get("id", "")).strip()
-    if not user_id:
-        raise HTTPException(status_code=502, detail="تم التحقق من الدخول لكن السيرفر لم يُرجع معرّف الحساب.")
-    profile = _social_profile_by_user_id(user_id)
-    # Repair accounts created in Supabase Auth before their PHANTOM profile was written.
-    if not profile:
-        metadata = user.get("user_metadata") or user.get("raw_user_meta_data") or {}
-        candidate = str(metadata.get("username") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,30}", candidate):
-            email_prefix = str(user.get("email") or req.email).split("@", 1)[0]
-            candidate = re.sub(r"[^A-Za-z0-9_.-]", "_", email_prefix)[:24].strip("._-")
-        if len(candidate) < 3:
-            candidate = "user_" + secrets.token_hex(4)
-        base_username = candidate[:24]
-        candidate = base_username
-        # Resolve username collisions deterministically without exposing account data.
-        for attempt in range(1, 8):
-            q = "phantom_profiles?select=user_id&username=eq." + urllib.parse.quote(candidate, safe="") + "&limit=1"
-            lookup_status, matches = _social_db(q)
-            if lookup_status != 200:
-                logger.error("Cannot check profile username while repairing %s: status=%s", user_id, lookup_status)
-                raise HTTPException(status_code=503, detail="تعذر تجهيز الملف الشخصي بسبب اتصال قاعدة البيانات. أعد المحاولة لاحقًا.")
-            if not isinstance(matches, list) or not matches or str(matches[0].get("user_id")) == user_id:
-                break
-            suffix = "_" + str(attempt + 1)
-            candidate = base_username[:30-len(suffix)] + suffix
-        public_id = "PH" + secrets.token_hex(5).upper()
-        display_name = str(metadata.get("display_name") or metadata.get("full_name") or candidate).strip()[:60] or candidate
-        profile_payload = {"user_id": user_id, "public_id": public_id, "username": candidate, "display_name": display_name}
-        create_status, create_result = _social_db("phantom_profiles", method="POST", payload=profile_payload)
-        if create_status not in (200, 201):
-            # Another concurrent login may have repaired the profile; re-read before failing.
-            profile = _social_profile_by_user_id(user_id)
-            if not profile:
-                logger.error("Profile repair failed for %s: status=%s result=%s", user_id, create_status, str(create_result)[:300])
-                raise HTTPException(status_code=503, detail="تم تأكيد البريد، لكن تجهيز الملف الشخصي تعطل بسبب قاعدة البيانات. لم يتم حذف الحساب؛ أعد المحاولة أو افحص صلاحيات جدول phantom_profiles.")
+@app.get("/api/platform/moments")
+def platform_moments(authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
+    with _platform_lock:
+        moments = list(reversed(platform_state.get("moments", [])[-200:]))
+        users = platform_state.get("users", {})
+        for moment in moments:
+            owner = next((u for u in users.values() if u.get("id") == moment.get("user_id")), None)
+            moment["author"] = _platform_user_public(owner) if owner else {"id": moment.get("user_id"), "username": "محذوف", "profile": {}}
+        return {"ok": True, "moments": moments, "enabled": platform_state.get("settings", {}).get("moments_enabled", True)}
+
+
+@app.post("/api/platform/moments")
+def platform_create_moment(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    if not platform_state.get("settings", {}).get("moments_enabled", True):
+        raise HTTPException(status_code=403, detail="قسم اللحظات متوقف حاليًا.")
+    content = str(payload.get("content", "")).strip()
+    media = str(payload.get("media", "")).strip()
+    if not content and not media:
+        raise HTTPException(status_code=400, detail="اكتب منشورًا أو أضف صورة.")
+    if len(content) > 3000 or len(media) > 1_500_000:
+        raise HTTPException(status_code=413, detail="حجم المنشور أو الصورة أكبر من الحد المسموح.")
+    with _platform_lock:
+        moment = {"id": secrets.token_hex(8), "user_id": user["id"], "content": content, "media": media,
+                  "likes": [], "comments": [], "created_at": _platform_now()}
+        platform_state.setdefault("moments", []).append(moment)
+        platform_state["moments"] = platform_state["moments"][-1000:]
+        _platform_save_state()
+    return {"ok": True, "moment": moment}
+
+
+@app.post("/api/platform/moments/{moment_id}/like")
+def platform_like_moment(moment_id: str, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    with _platform_lock:
+        moment = next((m for m in platform_state.get("moments", []) if m.get("id") == moment_id), None)
+        if not moment: raise HTTPException(status_code=404, detail="المنشور غير موجود.")
+        likes = moment.setdefault("likes", [])
+        if user["id"] in likes: likes.remove(user["id"])
+        else: likes.append(user["id"])
+        _platform_save_state()
+        return {"ok": True, "liked": user["id"] in likes, "likes": len(likes)}
+
+
+@app.post("/api/platform/moments/{moment_id}/comments")
+def platform_comment_moment(moment_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    content = str(payload.get("content", "")).strip()
+    if not content or len(content) > 1000: raise HTTPException(status_code=400, detail="اكتب تعليقًا من 1 إلى 1000 حرف.")
+    with _platform_lock:
+        moment = next((m for m in platform_state.get("moments", []) if m.get("id") == moment_id), None)
+        if not moment: raise HTTPException(status_code=404, detail="المنشور غير موجود.")
+        moment.setdefault("comments", []).append({"id": secrets.token_hex(6), "user_id": user["id"], "username": user["username"], "content": content, "created_at": _platform_now()})
+        moment["comments"] = moment["comments"][-300:]
+        _platform_save_state()
+        return {"ok": True, "comments": moment["comments"]}
+
+
+@app.get("/api/platform/messages")
+def platform_messages(with_user: str = "", authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    with _platform_lock:
+        messages = [m for m in platform_state.get("messages", []) if user.get("id") in (m.get("from_id"), m.get("to_id"))]
+        if with_user:
+            messages = [m for m in messages if with_user in (m.get("from_id"), m.get("to_id"))]
+        messages = messages[-300:]
+        messages.sort(key=lambda m: (not bool(m.get("pinned")), str(m.get("created_at", ""))))
+        users = {u.get("id"): _platform_user_public(u) for u in platform_state.get("users", {}).values()}
+        return {"ok": True, "messages": messages, "users": users, "chat_enabled": platform_state.get("settings", {}).get("chat_enabled", True)}
+
+
+@app.post("/api/platform/messages")
+def platform_send_message(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    if not platform_state.get("settings", {}).get("chat_enabled", True): raise HTTPException(status_code=403, detail="الدردشة متوقفة حاليًا.")
+    to_id = str(payload.get("to_id", "")).strip()
+    content = str(payload.get("content", "")).strip()
+    if not to_id or not content or len(content) > 3000: raise HTTPException(status_code=400, detail="المستلم والرسالة مطلوبان، والحد الأقصى 3000 حرف.")
+    with _platform_lock:
+        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == to_id), None)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        if user["id"] in target.get("blocked_users", []) or to_id in user.get("blocked_users", []): raise HTTPException(status_code=403, detail="لا يمكن إرسال الرسالة بسبب إعدادات الحظر.")
+        message = {"id": secrets.token_hex(8), "from_id": user["id"], "from_username": user["username"], "to_id": to_id,
+                   "to_username": target["username"], "content": content, "created_at": _platform_now(), "pinned": False, "read": False}
+        platform_state.setdefault("messages", []).append(message)
+        platform_state["messages"] = platform_state["messages"][-5000:]
+        _platform_save_state()
+        return {"ok": True, "message": message}
+
+
+@app.post("/api/platform/password")
+def platform_change_password(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    current = str(payload.get("current_password", "")); new = str(payload.get("new_password", "")); confirm = str(payload.get("confirm_password", ""))
+    _, current_hash = _platform_password_hash(current, user.get("password_salt", ""))
+    if not hmac.compare_digest(current_hash, str(user.get("password_hash", ""))): raise HTTPException(status_code=401, detail="كلمة المرور الحالية غير صحيحة.")
+    if len(new) < 8 or len(new) > 128: raise HTTPException(status_code=400, detail="كلمة المرور الجديدة يجب أن تكون من 8 إلى 128 حرفًا.")
+    if new != confirm: raise HTTPException(status_code=400, detail="تأكيد كلمة المرور غير مطابق.")
+    salt, digest = _platform_password_hash(new)
+    raw_token = (authorization or "").strip()
+    if raw_token.lower().startswith("bearer "): raw_token = raw_token[7:].strip()
+    current_session_hash = hashlib.sha256(raw_token.encode()).hexdigest() if raw_token else ""
+    with _platform_lock:
+        user["password_salt"] = salt; user["password_hash"] = digest
+        for session_hash, session in list(platform_state.get("sessions", {}).items()):
+            if session.get("user_key") == str(user.get("username", "")).casefold() and session_hash != current_session_hash:
+                platform_state["sessions"].pop(session_hash, None)
+        _platform_audit(user, "PASSWORD_CHANGED", user.get("id", ""))
+        _platform_save_state()
+    return {"ok": True, "message": "تم تغيير كلمة المرور بنجاح."}
+
+
+@app.post("/api/platform/block/{user_id}")
+def platform_block_user(user_id: str, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    if user_id == user.get("id"): raise HTTPException(status_code=400, detail="لا يمكنك حظر حسابك.")
+    target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id), None)
+    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    with _platform_lock:
+        blocked = user.setdefault("blocked_users", [])
+        if user_id in blocked: blocked.remove(user_id)
+        else: blocked.append(user_id)
+        _platform_save_state()
+    return {"ok": True, "blocked": user_id in user.get("blocked_users", [])}
+
+
+@app.post("/api/platform/messages/{message_id}/report")
+def platform_report_message(message_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    reason = str(payload.get("reason", "")).strip()[:500]
+    with _platform_lock:
+        message = next((m for m in platform_state.get("messages", []) if m.get("id") == message_id), None)
+        if not message or user.get("id") not in (message.get("from_id"), message.get("to_id")): raise HTTPException(status_code=404, detail="الرسالة غير موجودة أو ليست ضمن محادثاتك.")
+        report = {"id": secrets.token_hex(8), "message_id": message_id, "reporter_id": user.get("id"), "reason": reason or "بلاغ بدون تفاصيل", "status": "open", "created_at": _platform_now()}
+        platform_state.setdefault("reports", []).append(report); platform_state["reports"] = platform_state["reports"][-1000:]
+        _platform_save_state()
+    return {"ok": True, "report": report}
+
+
+@app.post("/api/platform/vip/request")
+def platform_vip_request(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    days = int(payload.get("days", 30))
+    if days not in (30, 150, 365): raise HTTPException(status_code=400, detail="خطة الاشتراك غير مدعومة.")
+    with _platform_lock:
+        platform_state.setdefault("audit", []).append({"id": secrets.token_hex(8), "action": "VIP_PAYMENT_REQUEST", "actor_id": user["id"], "target": user["id"], "detail": f"طلب VIP {days} يوم - مراجعة يدوية", "at": _platform_now()})
+        platform_state.setdefault("vip_requests", []).append({"id": secrets.token_hex(8), "user_id": user["id"], "username": user["username"], "days": days, "status": "pending", "created_at": _platform_now(), "method": str(payload.get("method", "agent"))[:40]})
+        _platform_save_state()
+    return {"ok": True, "message": "تم تسجيل طلب الاشتراك للمراجعة اليدوية. لم يتم تفعيل VIP أو تأكيد الدفع تلقائيًا."}
+
+
+@app.get("/api/platform/admin/summary")
+def platform_admin_summary(authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    users = list(platform_state.get("users", {}).values())
+    active_vip = sum(1 for u in users if _platform_user_public(u).get("vip", {}).get("active"))
+    return {"ok": True, "total_users": len(users), "vip_users": active_vip, "moments": len(platform_state.get("moments", [])),
+            "messages": len(platform_state.get("messages", [])), "pending_vip": sum(1 for r in platform_state.get("vip_requests", []) if r.get("status") == "pending"),
+            "audit": list(reversed(platform_state.get("audit", [])[-100:])), "role": actor.get("role"), "storage": "supabase" if SUPABASE_SERVICE_ROLE_KEY else "local_file"}
+
+
+@app.get("/api/platform/admin/users")
+def platform_admin_users(q: str = "", authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization, allow_moderator=True)
+    q = q.casefold().strip()
+    users = [_platform_user_public(u) for u in platform_state.get("users", {}).values() if not q or q in u.get("username", "").casefold() or q in u.get("id", "").casefold()]
+    return {"ok": True, "users": users[:500]}
+
+
+@app.patch("/api/platform/admin/users/{user_id}")
+def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id), None)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        if target.get("role") == "OWNER" and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="لا يمكن تعديل حساب المالك إلا بواسطة المالك.")
+        if "banned" in payload: target["banned"] = bool(payload["banned"])
+        if "role" in payload:
+            role = str(payload["role"]).upper()
+            if role not in {"USER", "MODERATOR", "ADMIN", "OWNER"}: raise HTTPException(status_code=400, detail="الدور غير مسموح.")
+            if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تعيين الأدوار الحساسة للمالك فقط.")
+            target["role"] = role
+        if "featured" in payload:
+            featured = platform_state.setdefault("featured_user_ids", [])
+            if bool(payload["featured"]) and user_id not in featured: featured.append(user_id)
+            if not bool(payload["featured"]) and user_id in featured: featured.remove(user_id)
+        if "badges" in payload and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="إدارة الشارات للمالك فقط.")
+        if "badges" in payload and actor.get("role") == "OWNER":
+            badges = payload["badges"] if isinstance(payload["badges"], list) else []
+            target["badges"] = [{"name": str(b.get("name", ""))[:60], "rarity": str(b.get("rarity", "rare"))[:30]} for b in badges[:50] if isinstance(b, dict) and str(b.get("name", "")).strip()]
+        if "display_id" in payload:
+            if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تخصيص الآيدي المميز للمالك فقط.")
+            custom_id = str(payload.get("display_id", "")).strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", custom_id): raise HTTPException(status_code=400, detail="الآيدي المميز يجب أن يكون 3–20 حرفًا/رقمًا أو - _")
+            if any(u.get("id") != user_id and u.get("display_id", u.get("id")) == custom_id for u in platform_state["users"].values()): raise HTTPException(status_code=409, detail="الآيدي المميز مستخدم بالفعل.")
+            target["display_id"] = custom_id
+        _platform_audit(actor, "USER_UPDATE", user_id, json.dumps({k: v for k, v in payload.items() if k != "password"}, ensure_ascii=False))
+        _platform_save_state()
+        return {"ok": True, "user": _platform_user_public(target)}
+
+
+@app.post("/api/platform/admin/vip")
+def platform_admin_vip(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    user_id = str(payload.get("user_id", "")).strip()
+    days = int(payload.get("days", 30))
+    active = bool(payload.get("active", True))
+    if days not in (30, 150, 365, 0): raise HTTPException(status_code=400, detail="المدة يجب أن تكون 30 أو 150 أو 365 يومًا أو 0 للإلغاء.")
+    with _platform_lock:
+        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id or u.get("username", "").casefold() == user_id.casefold()), None)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        now = datetime.now(timezone.utc)
+        if not active or days == 0:
+            target["vip"] = {"active": False, "plan_days": 0, "started_at": None, "expires_at": None}
         else:
-            profile = _social_profile_by_user_id(user_id)
-    if not profile:
-        raise HTTPException(status_code=503, detail="تعذر تحميل الملف الشخصي بعد تجهيزه. أعد المحاولة.")
-    now = datetime.now(timezone.utc).isoformat()
-    _social_db("phantom_presence?user_id=eq." + urllib.parse.quote(profile["user_id"], safe=""), method="PATCH", payload={"is_online": True, "last_seen_at": now, "updated_at": now})
-    return {"session": result, "profile": profile}
+            prior = target.get("vip", {})
+            try: old_exp = datetime.fromisoformat(str(prior.get("expires_at", "")).replace("Z", "+00:00"))
+            except Exception: old_exp = now
+            start = old_exp if prior.get("active") and old_exp > now else now
+            expiry = datetime.fromtimestamp(start.timestamp() + days * 86400, timezone.utc)
+            target["vip"] = {"active": True, "plan_days": days, "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expiry.isoformat().replace("+00:00", "Z")}
+        _platform_audit(actor, "VIP_UPDATE", user_id, json.dumps(target["vip"], ensure_ascii=False))
+        _platform_save_state()
+        return {"ok": True, "user": _platform_user_public(target)}
 
 
-@app.get("/api/account/me")
-def social_account_me(authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    profile = _social_profile_by_user_id(str(user["id"]))
-    if not profile: raise HTTPException(status_code=404, detail="الملف الشخصي غير موجود.")
-    return {"profile": profile, "email": user.get("email")}
+@app.get("/api/platform/admin/vip-requests")
+def platform_admin_vip_requests(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    return {"ok": True, "requests": list(reversed(platform_state.get("vip_requests", [])[-500:]))}
 
 
-@app.patch("/api/account/profile")
-def social_account_update_profile(req: ProfileUpdateRequest, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    changes = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
-    if "avatar_url" in changes and changes["avatar_url"] and not changes["avatar_url"].startswith(("https://", "http://")):
-        raise HTTPException(status_code=400, detail="رابط الصورة يجب أن يبدأ بـ http:// أو https://")
-    if not changes: raise HTTPException(status_code=400, detail="لا توجد تغييرات.")
-    changes["updated_at"] = datetime.now(timezone.utc).isoformat()
-    status, result = _social_db("phantom_profiles?user_id=eq." + urllib.parse.quote(str(user["id"]), safe=""), method="PATCH", payload=changes)
-    if status not in (200, 204): raise HTTPException(status_code=503, detail="تعذر تحديث الملف الشخصي.")
-    return {"profile": result[0] if isinstance(result, list) and result else _social_profile_by_user_id(str(user["id"]))}
+@app.patch("/api/platform/admin/vip-requests/{request_id}")
+def platform_admin_review_vip_request(request_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    status = str(payload.get("status", "")).lower()
+    if status not in {"approved", "rejected"}: raise HTTPException(status_code=400, detail="حالة المراجعة غير صحيحة.")
+    with _platform_lock:
+        req = next((r for r in platform_state.get("vip_requests", []) if r.get("id") == request_id), None)
+        if not req: raise HTTPException(status_code=404, detail="طلب الاشتراك غير موجود.")
+        req["status"] = status; req["reviewed_at"] = _platform_now(); req["reviewed_by"] = actor.get("id")
+        if status == "approved":
+            target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == req.get("user_id")), None)
+            if target:
+                now = datetime.now(timezone.utc); days = int(req.get("days", 30))
+                target["vip"] = {"active": True, "plan_days": days, "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": datetime.fromtimestamp(now.timestamp()+days*86400, timezone.utc).isoformat().replace("+00:00", "Z")}
+        _platform_audit(actor, "VIP_REQUEST_REVIEW", request_id, status)
+        _platform_save_state()
+    return {"ok": True, "request": req}
 
 
-@app.get("/api/social/users")
-def social_search_users(q: str = "", limit: int = 20, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    limit = max(1, min(limit, 50))
-    query = urllib.parse.quote((q or "").strip(), safe="")
-    path = "phantom_profiles?select=user_id,public_id,username,display_name,avatar_url,bio,created_at&order=created_at.desc&limit=" + str(limit)
-    if q.strip(): path += "&or=(username.ilike.*" + query + "*,display_name.ilike.*" + query + "*,public_id.ilike.*" + query + "*)"
-    status, profiles = _social_db(path)
-    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل المستخدمين.")
-    return {"users": [p for p in profiles if p.get("user_id") != user["id"]] if isinstance(profiles, list) else []}
+@app.get("/api/platform/admin/messages")
+def platform_admin_messages(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization, allow_moderator=True)
+    return {"ok": True, "messages": list(reversed(platform_state.get("messages", [])[-200:])), "reports": list(reversed(platform_state.get("reports", [])[-200:]))}
 
 
-@app.post("/api/social/friend-requests")
-def social_send_friend_request(req: UserTargetRequest, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    target = _social_profile_by_public_id(req.public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك إضافة نفسك.")
-    status, result = _social_db("phantom_friend_requests", method="POST", payload={"sender_id": user["id"], "receiver_id": target["user_id"]})
-    if status not in (200, 201): raise HTTPException(status_code=409, detail="تعذر إرسال الطلب؛ قد يوجد طلب سابق بين الحسابين.")
-    return {"request": result[0] if isinstance(result, list) and result else result}
+@app.patch("/api/platform/admin/messages/{message_id}")
+def platform_admin_message_update(message_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    with _platform_lock:
+        message = next((m for m in platform_state.get("messages", []) if m.get("id") == message_id), None)
+        if not message: raise HTTPException(status_code=404, detail="الرسالة غير موجودة.")
+        if "pinned" in payload: message["pinned"] = bool(payload["pinned"])
+        if payload.get("delete") is True: platform_state["messages"] = [m for m in platform_state.get("messages", []) if m.get("id") != message_id]
+        _platform_audit(actor, "MESSAGE_MODERATION", message_id, json.dumps(payload, ensure_ascii=False))
+        _platform_save_state()
+    return {"ok": True}
 
 
-@app.get("/api/social/friend-requests")
-def social_list_friend_requests(authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    uid = urllib.parse.quote(str(user["id"]), safe="")
-    status, result = _social_db("phantom_friend_requests?select=*&or=(sender_id.eq." + uid + ",receiver_id.eq." + uid + ")&order=created_at.desc&limit=100")
-    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل طلبات الصداقة.")
-    return {"requests": result if isinstance(result, list) else []}
+@app.patch("/api/platform/admin/reports/{report_id}")
+def platform_admin_report_update(report_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    status = str(payload.get("status", "reviewed"))
+    if status not in {"reviewed", "dismissed", "actioned"}: raise HTTPException(status_code=400, detail="حالة البلاغ غير صحيحة.")
+    with _platform_lock:
+        report = next((r for r in platform_state.get("reports", []) if r.get("id") == report_id), None)
+        if not report: raise HTTPException(status_code=404, detail="البلاغ غير موجود.")
+        report["status"] = status; report["reviewed_at"] = _platform_now(); report["reviewed_by"] = actor.get("id")
+        _platform_audit(actor, "REPORT_REVIEW", report_id, status)
+        _platform_save_state()
+    return {"ok": True, "report": report}
 
 
-@app.post("/api/social/follow")
-def social_follow(req: UserTargetRequest, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    target = _social_profile_by_public_id(req.public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك متابعة نفسك.")
-    status, result = _social_db("phantom_follows", method="POST", payload={"follower_id": user["id"], "followed_id": target["user_id"]})
-    if status not in (200, 201): raise HTTPException(status_code=409, detail="أنت تتابع هذا المستخدم بالفعل أو تعذر تنفيذ الطلب.")
-    return {"success": True}
+@app.delete("/api/platform/admin/moments/{moment_id}")
+def platform_admin_delete_moment(moment_id: str, authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    with _platform_lock:
+        before = len(platform_state.get("moments", []))
+        platform_state["moments"] = [m for m in platform_state.get("moments", []) if m.get("id") != moment_id]
+        if len(platform_state["moments"]) == before: raise HTTPException(status_code=404, detail="المنشور غير موجود.")
+        _platform_audit(actor, "MOMENT_DELETE", moment_id)
+        _platform_save_state()
+    return {"ok": True}
 
 
-@app.delete("/api/social/follow/{public_id}")
-def social_unfollow(public_id: str, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    target = _social_profile_by_public_id(public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-    status, result = _social_db("phantom_follows?follower_id=eq." + urllib.parse.quote(str(user["id"]), safe="") + "&followed_id=eq." + urllib.parse.quote(str(target["user_id"]), safe=""), method="DELETE")
-    if status not in (200, 204): raise HTTPException(status_code=503, detail="تعذر إلغاء المتابعة.")
-    return {"success": True}
+@app.post("/api/platform/admin/apps")
+def platform_admin_add_app(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    name = str(payload.get("name", "")).strip()
+    app_id = re.sub(r"[^a-z0-9_-]+", "", str(payload.get("id", name.casefold().replace(" ", "-"))).casefold())[:40]
+    if len(app_id) < 2: app_id = "app-" + secrets.token_hex(4)
+    if len(name) < 2 or len(name) > 60: raise HTTPException(status_code=400, detail="اسم التطبيق غير صالح.")
+    with _platform_lock:
+        if any(a.get("id") == app_id or a.get("name", "").casefold() == name.casefold() for a in platform_state.get("apps", [])):
+            raise HTTPException(status_code=409, detail="التطبيق أو المعرّف موجود بالفعل.")
+        item = {"id": app_id, "name": name, "active": True, "engine": "FARM"}
+        platform_state.setdefault("apps", []).append(item)
+        _platform_audit(actor, "APP_ADD", app_id, name)
+        _platform_save_state()
+    return {"ok": True, "app": item}
 
 
-@app.post("/api/social/messages")
-def social_send_message(req: DirectMessageRequest, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    target = _social_profile_by_public_id(req.receiver_public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستلم غير موجود.")
-    if target["user_id"] == user["id"]: raise HTTPException(status_code=400, detail="لا يمكنك مراسلة نفسك.")
-    status, result = _social_db("phantom_messages", method="POST", payload={"sender_id": user["id"], "receiver_id": target["user_id"], "body": req.body.strip()})
-    if status not in (200, 201): raise HTTPException(status_code=503, detail="تعذر إرسال الرسالة.")
-    return {"message": result[0] if isinstance(result, list) and result else result}
+@app.patch("/api/platform/admin/apps/{app_id}")
+def platform_admin_app_update(app_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        app_item = next((a for a in platform_state.get("apps", []) if a.get("id") == app_id), None)
+        if not app_item: raise HTTPException(status_code=404, detail="التطبيق غير موجود.")
+        if "active" in payload: app_item["active"] = bool(payload["active"])
+        # All supported integrations are deliberately constrained to the Farm engine.
+        app_item["engine"] = "FARM"
+        _platform_audit(actor, "APP_UPDATE", app_id, json.dumps(payload, ensure_ascii=False))
+        _platform_save_state()
+        return {"ok": True, "app": app_item}
 
 
-@app.get("/api/social/messages/{public_id}")
-def social_get_messages(public_id: str, limit: int = 50, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    target = _social_profile_by_public_id(public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-    limit = max(1, min(limit, 100))
-    uid, tid = urllib.parse.quote(str(user["id"]), safe=""), urllib.parse.quote(str(target["user_id"]), safe="")
-    path = "phantom_messages?select=id,sender_id,receiver_id,body,created_at,read_at&or=(and(sender_id.eq." + uid + ",receiver_id.eq." + tid + "),and(sender_id.eq." + tid + ",receiver_id.eq." + uid + "))&order=created_at.desc&limit=" + str(limit)
-    status, result = _social_db(path)
-    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل المحادثة.")
-    return {"messages": list(reversed(result)) if isinstance(result, list) else []}
+@app.patch("/api/platform/admin/settings")
+def platform_admin_settings(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    allowed = {"chat_enabled", "moments_enabled", "sound_enabled", "theme"}
+    with _platform_lock:
+        for key in allowed:
+            if key in payload: platform_state.setdefault("settings", {})[key] = payload[key]
+        _platform_audit(actor, "SETTINGS_UPDATE", "settings", json.dumps(payload, ensure_ascii=False))
+        _platform_save_state()
+    return {"ok": True, "settings": platform_state["settings"]}
 
 
-@app.post("/api/social/presence")
-def social_update_presence(req: PresenceRequest, authorization: Optional[str] = Header(default=None)):
-    user = _social_current_user(authorization)
-    now = datetime.now(timezone.utc).isoformat()
-    uid = urllib.parse.quote(str(user["id"]), safe="")
-    payload = {"user_id": user["id"], "is_online": req.is_online, "last_seen_at": now, "updated_at": now}
-    status, result = _social_db("phantom_presence?on_conflict=user_id", method="POST", payload=payload,
-                                extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"})
-    if status not in (200, 201):
-        # If the upsert preference is unsupported, try an update then insert.
-        status2, _ = _social_db("phantom_presence?user_id=eq." + uid, method="PATCH", payload={"is_online": req.is_online, "last_seen_at": now, "updated_at": now})
-        if status2 not in (200, 204): raise HTTPException(status_code=503, detail="تعذر تحديث حالة الاتصال.")
-    return {"success": True, "is_online": req.is_online, "last_seen_at": now}
+@app.post("/api/platform/admin/announcements")
+def platform_admin_announcement(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    text_value = str(payload.get("text", "")).strip()
+    if not text_value or len(text_value) > 500: raise HTTPException(status_code=400, detail="الإعلان مطلوب وبحد أقصى 500 حرف.")
+    with _platform_lock:
+        item = {"id": secrets.token_hex(6), "text": text_value, "pinned": bool(payload.get("pinned", True)), "created_at": _platform_now(), "created_by": actor.get("id")}
+        platform_state.setdefault("announcements", []).append(item); platform_state["announcements"] = platform_state["announcements"][-100:]
+        _platform_audit(actor, "ANNOUNCEMENT_CREATE", item["id"], text_value)
+        _platform_save_state()
+    return {"ok": True, "announcement": item}
 
 
-@app.get("/api/social/presence/{public_id}")
-def social_get_presence(public_id: str, authorization: Optional[str] = Header(default=None)):
-    _social_current_user(authorization)
-    target = _social_profile_by_public_id(public_id.strip())
-    if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-    uid = urllib.parse.quote(str(target["user_id"]), safe="")
-    status, result = _social_db("phantom_presence?select=is_online,last_seen_at,updated_at&user_id=eq." + uid)
-    if status != 200: raise HTTPException(status_code=503, detail="تعذر تحميل حالة الاتصال.")
-    return {"presence": result[0] if isinstance(result, list) and result else {"is_online": False, "last_seen_at": None}}
+@app.get("/api/platform/announcements")
+def platform_announcements(authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
+    return {"ok": True, "announcements": list(reversed(platform_state.get("announcements", [])[-50:]))}
 
+
+@app.post("/api/platform/predict")
+async def platform_predict(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    history = payload.get("history", [])
+    if not isinstance(history, list): raise HTTPException(status_code=400, detail="سجل المزرعة يجب أن يكون قائمة.")
+    is_vip = bool(_platform_user_public(user).get("vip", {}).get("active"))
+    max_history = 100 if is_vip else 8
+    clean_history = [str(x) for x in history][-max_history:]
+    result = await predict_endpoint(PredictionRequest(game_type="FARM", history=clean_history, room_id="platform-farm", coins=0), authorization=authorization)
+    record = {"id": secrets.token_hex(8), "user_id": user["id"], "mode": "VIP" if is_vip else "FREE",
+              "history_count": len(clean_history), "prediction": result.get("prediction", ""), "confidence": result.get("confidence"),
+              "created_at": _platform_now(), "source": "history_analysis_not_live_game_feed"}
+    with _platform_lock:
+        platform_state.setdefault("predictions", []).append(record); platform_state["predictions"] = platform_state["predictions"][-5000:]
+        _platform_save_state()
+    return {"ok": True, "record": record, "analysis": result, "notice": ("تحليل إحصائي للسجل المدخل فقط؛ لا يوجد اتصال مباشر مؤكد بنتائج اللعبة ولا ضمان للنتيجة التالية." if is_vip else "الوضع المجاني يستخدم آخر 8 نتائج فقط. التحليل إحصائي وليس اتصالًا مباشرًا بسيرفر اللعبة ولا ضمانًا للنتيجة التالية.")}
+
+
+@app.get("/api/platform/predictions/history")
+def platform_prediction_history(authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    rows = [r for r in platform_state.get("predictions", []) if r.get("user_id") == user.get("id")]
+    return {"ok": True, "history": list(reversed(rows[-100:]))}
 
 
 @app.get("/")
 def root():
     return {
-        "status": "Phantom Statistical & Lifecycle Server v120.8 Online",
+        "status": "PHANTOM ELITE Platform & Farm Engine v122.0 Online",
         "endpoints": [
+            "/api/platform/auth/signup", "/api/platform/auth/login", "/api/platform/me",
+            "/api/platform/apps", "/api/platform/moments", "/api/platform/messages",
+            "/api/platform/vip/request", "/api/platform/predict", "/api/platform/admin/summary",
             "/api/predict",
             "/api/health",
             "/api/config",
