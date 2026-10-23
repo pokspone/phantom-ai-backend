@@ -2270,7 +2270,7 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     # Backfill profile fields for accounts created by older builds so the profile UI never receives null/missing fields.
     username = str(user.get("username") or "عضو جديد")
     profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
-    profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": ""}
+    profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": "", "age": "", "gender": "", "country": "", "job": "", "interests": "", "social": ""}
     normalized_profile = {**profile_defaults, **profile}
     user["profile"] = normalized_profile
     # One stable public ID is shared across profile, user cards, and admin panel.
@@ -2430,6 +2430,13 @@ def platform_me(authorization: Optional[str] = Header(default=None)):
     return {"ok": True, "user": _platform_user_public(user), "settings": platform_state.get("settings", {})}
 
 
+def _platform_can_animate(user: Dict[str, Any]) -> bool:
+    if user.get("role") == "OWNER": return True
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
+    active = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+    return active and int(vip.get("plan_days", 0) or 0) >= 365
+
+
 @app.post("/api/platform/media/upload")
 def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
@@ -2437,6 +2444,7 @@ def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] 
     match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", data_url)
     if not match: raise HTTPException(status_code=400, detail="صيغة الصورة غير مدعومة. استخدم JPG أو PNG أو WEBP أو GIF.")
     mime, encoded = match.groups()
+    if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP3 السنوي فقط.")
     try: raw = base64.b64decode(encoded, validate=True)
     except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
     if not raw or len(raw) > 950 * 1024: raise HTTPException(status_code=413, detail="حجم الصورة يجب ألا يتجاوز 950 كيلوبايت.")
@@ -2466,15 +2474,22 @@ def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] 
 @app.patch("/api/platform/profile")
 def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
-    allowed = {"display_name", "bio", "avatar", "banner", "city", "governorate", "relationship"}
+    allowed = {"display_name", "bio", "avatar", "banner", "city", "governorate", "relationship", "age", "gender", "country", "job", "interests", "social"}
     profile = user.setdefault("profile", {})
     for field in allowed:
         if field in payload:
             value = str(payload[field] or "").strip()
+            if field in {"avatar", "banner"} and value.startswith("data:image/gif") and not _platform_can_animate(user):
+                raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP3 السنوي فقط.")
             if field in {"avatar", "banner"} and len(value) > 1_500_000:
                 raise HTTPException(status_code=413, detail="الصورة كبيرة جدًا؛ الحد الأقصى 1.5 ميجابايت.")
             if field not in {"avatar", "banner"} and len(value) > 500:
                 raise HTTPException(status_code=400, detail=f"القيمة طويلة جدًا للحقل {field}.")
+            if field == "age" and value:
+                if not value.isdigit() or not (13 <= int(value) <= 99):
+                    raise HTTPException(status_code=400, detail="السن يجب أن يكون رقمًا بين 13 و99.")
+            if field == "gender" and value not in {"", "ذكر", "أنثى"}:
+                raise HTTPException(status_code=400, detail="قيمة النوع غير صالحة.")
             profile[field] = value
     with _platform_lock:
         _platform_save_state()
@@ -3030,20 +3045,9 @@ async def platform_predict(payload: Dict[str, Any], authorization: Optional[str]
     max_history = 100 if is_vip else 8
     clean_history = [str(x) for x in history][-max_history:]
     result = await predict_endpoint(PredictionRequest(game_type="FARM", history=clean_history, room_id="platform-farm", coins=0), authorization=authorization)
-    record = {"id": secrets.token_hex(8), "user_id": user["id"], "mode": "VIP" if is_vip else "FREE",
-              "history_count": len(clean_history), "prediction": result.get("prediction", ""), "confidence": result.get("confidence"),
-              "created_at": _platform_now(), "source": "history_analysis_not_live_game_feed"}
-    with _platform_lock:
-        platform_state.setdefault("predictions", []).append(record); platform_state["predictions"] = platform_state["predictions"][-5000:]
-        _platform_save_state()
+    record = {"mode": "VIP" if is_vip else "FREE", "history_count": len(clean_history), "source": "history_analysis_not_live_game_feed"}
     return {"ok": True, "record": record, "analysis": result, "notice": ("تحليل إحصائي للسجل المدخل فقط؛ لا يوجد اتصال مباشر مؤكد بنتائج اللعبة ولا ضمان للنتيجة التالية." if is_vip else "الوضع المجاني يستخدم آخر 8 نتائج فقط. التحليل إحصائي وليس اتصالًا مباشرًا بسيرفر اللعبة ولا ضمانًا للنتيجة التالية.")}
 
-
-@app.get("/api/platform/predictions/history")
-def platform_prediction_history(authorization: Optional[str] = Header(default=None)):
-    user = _platform_find_session(authorization)
-    rows = [r for r in platform_state.get("predictions", []) if r.get("user_id") == user.get("id")]
-    return {"ok": True, "history": list(reversed(rows[-100:]))}
 
 
 @app.get("/")
