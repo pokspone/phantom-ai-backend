@@ -2267,10 +2267,17 @@ def _platform_now() -> str:
 
 
 def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
-    vip = user.get("vip") or {}
+    # Backfill profile fields for accounts created by older builds so the profile UI never receives null/missing fields.
+    username = str(user.get("username") or "عضو جديد")
+    profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+    profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": ""}
+    normalized_profile = {**profile_defaults, **profile}
+    user["profile"] = normalized_profile
+    user.setdefault("badges", [])
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
     active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
     return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "username": user.get("username"), "role": user.get("role", "USER"),
-            "profile": user.get("profile", {}), "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip},
+            "profile": normalized_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip},
             "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned"))}
 
 
@@ -2483,6 +2490,8 @@ def platform_users(q: str = "", authorization: Optional[str] = Header(default=No
 def platform_apps(authorization: Optional[str] = Header(default=None)):
     _platform_find_session(authorization)
     apps = [a for a in platform_state.get("apps", []) if str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) or a.get("created_by_admin") is True]
+    if not any(str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) for a in apps):
+        apps.insert(0, {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"})
     return {"ok": True, "apps": apps, "engine": "FARM"}
 
 
