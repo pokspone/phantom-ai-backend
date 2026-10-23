@@ -2589,6 +2589,20 @@ def platform_create_moment(payload: Dict[str, Any], authorization: Optional[str]
     return {"ok": True, "moment": moment}
 
 
+@app.delete("/api/platform/moments/{moment_id}")
+def platform_delete_own_moment(moment_id: str, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    with _platform_lock:
+        items = platform_state.get("moments", [])
+        target = next((x for x in items if x.get("id") == moment_id), None)
+        if not target: raise HTTPException(status_code=404, detail="المنشور غير موجود.")
+        if target.get("user_id") != user.get("id") and user.get("role") not in {"OWNER", "ADMIN", "MODERATOR"}:
+            raise HTTPException(status_code=403, detail="لا يمكنك حذف منشور غيرك.")
+        platform_state["moments"] = [x for x in items if x.get("id") != moment_id]
+        _platform_save_state()
+    return {"ok": True}
+
+
 @app.post("/api/platform/moments/{moment_id}/like")
 def platform_like_moment(moment_id: str, authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
