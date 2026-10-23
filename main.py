@@ -2192,7 +2192,7 @@ _platform_lock = threading.RLock()
 
 def _platform_default_state() -> Dict[str, Any]:
     return {
-        "users": {}, "sessions": {}, "moments": [], "messages": [], "reports": [], "predictions": [],
+        "users": {}, "sessions": {}, "moments": [], "messages": [], "support_messages": [], "reports": [], "predictions": [],
         "announcements": [], "featured_user_ids": [], "audit": [],
         "apps": [
             {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
@@ -2223,6 +2223,7 @@ def _platform_load_state() -> Dict[str, Any]:
 
 
 platform_state = _platform_load_state()
+platform_state.setdefault("support_messages", [])
 _platform_last_saved_state = copy.deepcopy(platform_state)
 
 
@@ -2546,34 +2547,80 @@ def platform_comment_moment(moment_id: str, payload: Dict[str, Any], authorizati
 
 @app.get("/api/platform/messages")
 def platform_messages(with_user: str = "", authorization: Optional[str] = Header(default=None)):
-    user = _platform_find_session(authorization)
-    with _platform_lock:
-        messages = [m for m in platform_state.get("messages", []) if user.get("id") in (m.get("from_id"), m.get("to_id"))]
-        if with_user:
-            messages = [m for m in messages if with_user in (m.get("from_id"), m.get("to_id"))]
-        messages = messages[-300:]
-        messages.sort(key=lambda m: (not bool(m.get("pinned")), str(m.get("created_at", ""))))
-        users = {u.get("id"): _platform_user_public(u) for u in platform_state.get("users", {}).values()}
-        return {"ok": True, "messages": messages, "users": users, "chat_enabled": platform_state.get("settings", {}).get("chat_enabled", True)}
+    # Direct user-to-user chat is disabled. Customer support uses its own private thread.
+    _platform_find_session(authorization)
+    return {"ok": True, "messages": [], "users": {}, "chat_enabled": platform_state.get("settings", {}).get("chat_enabled", True)}
 
 
 @app.post("/api/platform/messages")
 def platform_send_message(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
+    raise HTTPException(status_code=403, detail="التواصل بين المستخدمين غير متاح. استخدم محادثة خدمة العملاء.")
+
+
+@app.get("/api/platform/support/messages")
+def platform_support_messages(authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
-    if not platform_state.get("settings", {}).get("chat_enabled", True): raise HTTPException(status_code=403, detail="الدردشة متوقفة حاليًا.")
-    to_id = str(payload.get("to_id", "")).strip()
-    content = str(payload.get("content", "")).strip()
-    if not to_id or not content or len(content) > 3000: raise HTTPException(status_code=400, detail="المستلم والرسالة مطلوبان، والحد الأقصى 3000 حرف.")
     with _platform_lock:
-        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == to_id), None)
-        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-        if user["id"] in target.get("blocked_users", []) or to_id in user.get("blocked_users", []): raise HTTPException(status_code=403, detail="لا يمكن إرسال الرسالة بسبب إعدادات الحظر.")
-        message = {"id": secrets.token_hex(8), "from_id": user["id"], "from_username": user["username"], "to_id": to_id,
-                   "to_username": target["username"], "content": content, "created_at": _platform_now(), "pinned": False, "read": False}
-        platform_state.setdefault("messages", []).append(message)
-        platform_state["messages"] = platform_state["messages"][-5000:]
+        rows = [m for m in platform_state.get("support_messages", []) if m.get("user_id") == user.get("id")]
+        return {"ok": True, "messages": rows[-500:], "support_name": "خدمة العملاء"}
+
+
+@app.post("/api/platform/support/messages")
+def platform_support_send(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    if not platform_state.get("settings", {}).get("chat_enabled", True):
+        raise HTTPException(status_code=403, detail="خدمة الرسائل متوقفة حاليًا.")
+    content = str(payload.get("content", "")).strip()
+    if not content or len(content) > 3000:
+        raise HTTPException(status_code=400, detail="اكتب رسالة لا تتجاوز 3000 حرف.")
+    with _platform_lock:
+        row = {"id": secrets.token_hex(8), "user_id": user.get("id"), "username": user.get("username"),
+               "sender_role": "user", "content": content, "created_at": _platform_now(), "read": False}
+        platform_state.setdefault("support_messages", []).append(row)
+        platform_state["support_messages"] = platform_state["support_messages"][-10000:]
         _platform_save_state()
-        return {"ok": True, "message": message}
+        return {"ok": True, "message": row}
+
+
+@app.get("/api/platform/admin/support/messages")
+def platform_admin_support_messages(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization, allow_moderator=True)
+    with _platform_lock:
+        rows = list(platform_state.get("support_messages", []))
+        users = {u.get("id"): _platform_user_public(u) for u in platform_state.get("users", {}).values()}
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row.get("user_id"), []).append(row)
+        conversations = []
+        for uid, msgs in grouped.items():
+            user = users.get(uid, {})
+            conversations.append({"user_id": uid, "username": user.get("username", msgs[0].get("username", "مستخدم")),
+                                 "display_name": (user.get("profile") or {}).get("display_name", ""),
+                                 "messages": msgs[-500:], "last_at": msgs[-1].get("created_at", "")})
+        conversations.sort(key=lambda c: c.get("last_at", ""), reverse=True)
+        return {"ok": True, "conversations": conversations}
+
+
+@app.post("/api/platform/admin/support/messages")
+def platform_admin_support_reply(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    user_id = str(payload.get("user_id", "")).strip()
+    content = str(payload.get("content", "")).strip()
+    if not user_id or not content or len(content) > 3000:
+        raise HTTPException(status_code=400, detail="المستخدم والرسالة مطلوبان، بحد أقصى 3000 حرف.")
+    with _platform_lock:
+        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        row = {"id": secrets.token_hex(8), "user_id": user_id, "username": target.get("username"),
+               "sender_role": "support", "sender_name": "خدمة العملاء", "admin_username": actor.get("username"),
+               "content": content, "created_at": _platform_now(), "read": True}
+        platform_state.setdefault("support_messages", []).append(row)
+        platform_state["support_messages"] = platform_state["support_messages"][-10000:]
+        _platform_save_state()
+        _platform_audit(actor, "SUPPORT_REPLY", user_id, content[:160])
+        return {"ok": True, "message": row}
 
 
 @app.post("/api/platform/password")
