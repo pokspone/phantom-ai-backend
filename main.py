@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="BOOM PREMIUM QUILT EDITION API", version="123.2")
+app = FastAPI(title="PHANTOM ELITE Platform & Farm Engine", version="123.3")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -41,7 +41,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Admin-Token", "X-Reseller-Token", "Authorization", "apikey"],
 )
 
@@ -1542,7 +1542,7 @@ def health_check():
     return {
         "ok": True,
         "service": "PHANTOM ELITE Platform & Farm Engine",
-        "version": "123.2",
+        "version": "122.0",
         "lifecycle": state,
         "storage": {
             "mode": "supabase_reseller_state" if SUPABASE_SERVICE_ROLE_KEY else ("railway_volume" if os.path.ismount("/data") else "local_ephemeral"),
@@ -2197,7 +2197,7 @@ def _platform_default_state() -> Dict[str, Any]:
         "apps": [
             {"id": "toptop", "name": "TopTop", "active": True, "engine": "FARM"},
             {"id": "xena", "name": "Xena", "active": True, "engine": "FARM"},
-            {"id": "hifami", "name": "Hi fami", "active": True, "engine": "FARM"},
+            {"id": "hifami", "name": "Hi fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png"},
             {"id": "mico", "name": "Mico", "active": True, "engine": "FARM"},
             {"id": "helloyo", "name": "Hello Yo", "active": True, "engine": "FARM"},
             {"id": "taka", "name": "Taka", "active": True, "engine": "FARM"},
@@ -2205,7 +2205,7 @@ def _platform_default_state() -> Dict[str, Any]:
             {"id": "sugu", "name": "SUGU", "active": True, "engine": "FARM"},
             {"id": "4funlite", "name": "4Fun Lite", "active": True, "engine": "FARM"},
         ],
-        "settings": {"app_name": "BOOM - PREMIUM QUILT EDITION", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "chat_enabled": True, "moments_enabled": True},
+        "settings": {"app_name": "PHANTOM ELITE", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "chat_enabled": True, "moments_enabled": True},
     }
 
 
@@ -2332,7 +2332,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "BOOM - PREMIUM QUILT EDITION", "release": "v123.2", "prediction_engine": "FARM_ONLY", "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v123.3", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 30, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2783,7 +2783,10 @@ def platform_admin_add_app(payload: Dict[str, Any], authorization: Optional[str]
     with _platform_lock:
         if any(a.get("id") == app_id or a.get("name", "").casefold() == name.casefold() for a in platform_state.get("apps", [])):
             raise HTTPException(status_code=409, detail="التطبيق أو المعرّف موجود بالفعل.")
-        item = {"id": app_id, "name": name, "active": True, "engine": "FARM"}
+        icon_url = str(payload.get("icon_url", "")).strip()
+        if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+        item = {"id": app_id, "name": name, "active": True, "engine": "FARM", "icon_url": icon_url}
         platform_state.setdefault("apps", []).append(item)
         _platform_audit(actor, "APP_ADD", app_id, name)
         _platform_save_state()
@@ -2797,6 +2800,11 @@ def platform_admin_app_update(app_id: str, payload: Dict[str, Any], authorizatio
         app_item = next((a for a in platform_state.get("apps", []) if a.get("id") == app_id), None)
         if not app_item: raise HTTPException(status_code=404, detail="التطبيق غير موجود.")
         if "active" in payload: app_item["active"] = bool(payload["active"])
+        if "icon_url" in payload:
+            icon_url = str(payload.get("icon_url", "")).strip()
+            if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
+                raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+            app_item["icon_url"] = icon_url
         # All supported integrations are deliberately constrained to the Farm engine.
         app_item["engine"] = "FARM"
         _platform_audit(actor, "APP_UPDATE", app_id, json.dumps(payload, ensure_ascii=False))
