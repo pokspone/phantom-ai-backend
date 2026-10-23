@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PhantomStatisticalServer")
 
-app = FastAPI(title="PHANTOM ELITE Platform & Farm Engine", version="122.0")
+app = FastAPI(title="BOOM PREMIUM QUILT EDITION API", version="123.2")
 
 # Use explicit origins in production via PHANTOM_CORS_ORIGINS (comma-separated).
 # The app authenticates with bearer-style headers, so cross-origin cookies are not needed.
@@ -41,7 +41,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-Admin-Token", "X-Reseller-Token", "Authorization", "apikey"],
 )
 
@@ -1542,7 +1542,7 @@ def health_check():
     return {
         "ok": True,
         "service": "PHANTOM ELITE Platform & Farm Engine",
-        "version": "122.0",
+        "version": "123.2",
         "lifecycle": state,
         "storage": {
             "mode": "supabase_reseller_state" if SUPABASE_SERVICE_ROLE_KEY else ("railway_volume" if os.path.ismount("/data") else "local_ephemeral"),
@@ -2332,7 +2332,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "BOOM - PREMIUM QUILT EDITION", "release": "v123", "prediction_engine": "FARM_ONLY", "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "BOOM - PREMIUM QUILT EDITION", "release": "v123.2", "prediction_engine": "FARM_ONLY", "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
