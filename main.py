@@ -2332,7 +2332,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v123.3", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 30, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v123.6", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2383,6 +2383,17 @@ def platform_login(payload: Dict[str, Any]):
             raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة.")
         if user.get("banned"):
             raise HTTPException(status_code=403, detail="الحساب موقوف؛ تواصل مع الدعم.")
+        # Promote only the exact server-configured owner username after password verification.
+        # Never accept a client-supplied role or owner flag.
+        configured_owner = os.environ.get("PHANTOM_OWNER_USERNAME", "").strip().casefold()
+        if configured_owner and key == configured_owner:
+            if user.get("role") != "OWNER":
+                user["role"] = "OWNER"
+            badges = user.setdefault("badges", [])
+            if not any(str(b.get("name", "")).casefold() == "app owner" for b in badges if isinstance(b, dict)):
+                badges.append({"name": "App Owner", "rarity": "legendary"})
+            # The configured owner is the sole pinned/featured account.
+            platform_state["featured_user_ids"] = [user.get("id")]
         token = secrets.token_urlsafe(40)
         platform_state.setdefault("sessions", {})[hashlib.sha256(token.encode()).hexdigest()] = {"user_key": key, "expires": time.time() + 7 * 86400, "created_at": _platform_now()}
         user["last_active"] = _platform_now()
