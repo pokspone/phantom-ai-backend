@@ -2195,15 +2195,7 @@ def _platform_default_state() -> Dict[str, Any]:
         "users": {}, "sessions": {}, "moments": [], "messages": [], "reports": [], "predictions": [],
         "announcements": [], "featured_user_ids": [], "audit": [],
         "apps": [
-            {"id": "toptop", "name": "TopTop", "active": True, "engine": "FARM"},
-            {"id": "xena", "name": "Xena", "active": True, "engine": "FARM"},
-            {"id": "hifami", "name": "Hi fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png"},
-            {"id": "mico", "name": "Mico", "active": True, "engine": "FARM"},
-            {"id": "helloyo", "name": "Hello Yo", "active": True, "engine": "FARM"},
-            {"id": "taka", "name": "Taka", "active": True, "engine": "FARM"},
-            {"id": "soyo", "name": "SOYO", "active": True, "engine": "FARM"},
-            {"id": "sugu", "name": "SUGU", "active": True, "engine": "FARM"},
-            {"id": "4funlite", "name": "4Fun Lite", "active": True, "engine": "FARM"},
+            {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
         ],
         "settings": {"app_name": "PHANTOM ELITE", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "chat_enabled": True, "moments_enabled": True},
     }
@@ -2332,7 +2324,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v123.6", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v123.7", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2356,7 +2348,7 @@ def platform_signup(payload: Dict[str, Any]):
             user_id = "PH-" + secrets.token_hex(4).upper()
         owner_name = os.environ.get("PHANTOM_OWNER_USERNAME", "").strip().casefold()
         role = "OWNER" if owner_name and key == owner_name else "USER"
-        user = {"id": user_id, "display_id": user_id, "username": username, "password_salt": salt, "password_hash": digest, "role": role,
+        user = {"id": user_id, "display_id": str(secrets.randbelow(900000000) + 100000000), "username": username, "password_salt": salt, "password_hash": digest, "role": role,
                 "profile": {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": ""},
                 "badges": ([{"name": "App Owner", "rarity": "legendary"}] if role == "OWNER" else []),
                 "vip": {"active": False, "plan_days": 0, "started_at": None, "expires_at": None},
@@ -2383,6 +2375,11 @@ def platform_login(payload: Dict[str, Any]):
             raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة.")
         if user.get("banned"):
             raise HTTPException(status_code=403, detail="الحساب موقوف؛ تواصل مع الدعم.")
+        # Ensure every account has a stable numeric public ID while retaining the internal database key.
+        current_display_id = str(user.get("display_id", ""))
+        if not current_display_id.isdigit():
+            numeric = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % 900000000 + 100000000
+            user["display_id"] = str(numeric)
         # Promote only the exact server-configured owner username after password verification.
         # Never accept a client-supplied role or owner flag.
         configured_owner = os.environ.get("PHANTOM_OWNER_USERNAME", "").strip().casefold()
@@ -2484,7 +2481,8 @@ def platform_users(q: str = "", authorization: Optional[str] = Header(default=No
 @app.get("/api/platform/apps")
 def platform_apps(authorization: Optional[str] = Header(default=None)):
     _platform_find_session(authorization)
-    return {"ok": True, "apps": platform_state.get("apps", []), "engine": "FARM"}
+    apps = [a for a in platform_state.get("apps", []) if str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) or a.get("created_by_admin") is True]
+    return {"ok": True, "apps": apps, "engine": "FARM"}
 
 
 @app.get("/api/platform/moments")
@@ -2797,7 +2795,10 @@ def platform_admin_add_app(payload: Dict[str, Any], authorization: Optional[str]
         icon_url = str(payload.get("icon_url", "")).strip()
         if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
             raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
-        item = {"id": app_id, "name": name, "active": True, "engine": "FARM", "icon_url": icon_url}
+        game_image_url = str(payload.get("game_image_url", "")).strip()
+        if game_image_url and (len(game_image_url) > 500 or not game_image_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="رابط صورة المزرعة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+        item = {"id": app_id, "name": name, "active": True, "engine": "FARM", "icon_url": icon_url, "game_image_url": game_image_url, "created_by_admin": True}
         platform_state.setdefault("apps", []).append(item)
         _platform_audit(actor, "APP_ADD", app_id, name)
         _platform_save_state()
@@ -2816,6 +2817,11 @@ def platform_admin_app_update(app_id: str, payload: Dict[str, Any], authorizatio
             if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
                 raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
             app_item["icon_url"] = icon_url
+        if "game_image_url" in payload:
+            game_image_url = str(payload.get("game_image_url", "")).strip()
+            if game_image_url and (len(game_image_url) > 500 or not game_image_url.startswith("https://")):
+                raise HTTPException(status_code=400, detail="رابط صورة المزرعة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+            app_item["game_image_url"] = game_image_url
         # All supported integrations are deliberately constrained to the Farm engine.
         app_item["engine"] = "FARM"
         _platform_audit(actor, "APP_UPDATE", app_id, json.dumps(payload, ensure_ascii=False))
