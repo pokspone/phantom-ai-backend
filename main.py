@@ -2273,6 +2273,14 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": ""}
     normalized_profile = {**profile_defaults, **profile}
     user["profile"] = normalized_profile
+    # One stable public ID is shared across profile, user cards, and admin panel.
+    public_id = str(user.get("display_id", "")).strip()
+    if not re.fullmatch(r"\d{8,12}", public_id):
+        seed = str(user.get("id") or user.get("username") or username)
+        public_id = str(int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) % 900000000 + 100000000)
+        while any(other is not user and str(other.get("display_id", "")) == public_id for other in platform_state.get("users", {}).values()):
+            public_id = str(secrets.randbelow(900000000) + 100000000)
+        user["display_id"] = public_id
     user.setdefault("badges", [])
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
     active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
@@ -2486,12 +2494,51 @@ def platform_users(q: str = "", authorization: Optional[str] = Header(default=No
         return {"ok": True, "users": values[:100], "featured_user_ids": featured}
 
 
+# Real active-user presence is based on authenticated heartbeats, not random/fabricated counters.
+_platform_presence: Dict[str, Dict[str, Any]] = {}
+_platform_presence_lock = threading.RLock()
+
+@app.post("/api/platform/presence/heartbeat")
+def platform_presence_heartbeat(payload: Dict[str, Any] = {}, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    now = time.time()
+    uid = str(user.get("id", ""))
+    with _platform_presence_lock:
+        _platform_presence[uid] = {"last_seen": now, "page": str(payload.get("page", "Home"))[:40]}
+        cutoff = now - 90
+        for key in list(_platform_presence):
+            if float(_platform_presence[key].get("last_seen", 0)) < cutoff:
+                _platform_presence.pop(key, None)
+        count = len(_platform_presence)
+    return {"ok": True, "online_count": count, "window_seconds": 90, "source": "authenticated_heartbeats"}
+
+@app.get("/api/platform/presence/online")
+def platform_presence_online():
+    now = time.time()
+    with _platform_presence_lock:
+        cutoff = now - 90
+        for key in list(_platform_presence):
+            if float(_platform_presence[key].get("last_seen", 0)) < cutoff:
+                _platform_presence.pop(key, None)
+        count = len(_platform_presence)
+    return {"ok": True, "online_count": count, "window_seconds": 90, "source": "authenticated_heartbeats"}
+
+@app.get("/api/platform/health")
+def platform_health():
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v135", "catalog": True}
+
+
 @app.get("/api/platform/apps")
 def platform_apps(authorization: Optional[str] = Header(default=None)):
     # Public catalog: do not fail the whole home screen when a stale session token is present.
     apps = [a for a in platform_state.get("apps", []) if str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) or a.get("created_by_admin") is True]
     if not any(str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) for a in apps):
         apps.insert(0, {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"})
+    else:
+        for app in apps:
+            if str(app.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(app.get("name", "")), re.I):
+                app.setdefault("active", True)
+                app.setdefault("engine", "FARM")
     return {"ok": True, "apps": apps, "engine": "FARM"}
 
 
@@ -2765,7 +2812,7 @@ def platform_admin_summary(authorization: Optional[str] = Header(default=None)):
 def platform_admin_users(q: str = "", authorization: Optional[str] = Header(default=None)):
     _platform_require_admin(authorization, allow_moderator=True)
     q = q.casefold().strip()
-    users = [_platform_user_public(u) for u in platform_state.get("users", {}).values() if not q or q in u.get("username", "").casefold() or q in u.get("id", "").casefold()]
+    users = [_platform_user_public(u) for u in platform_state.get("users", {}).values() if not q or q in u.get("username", "").casefold() or q in u.get("id", "").casefold() or q in str(u.get("display_id", ""))]
     return {"ok": True, "users": users[:500]}
 
 
@@ -2793,8 +2840,8 @@ def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorizat
         if "display_id" in payload:
             if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تخصيص الآيدي المميز للمالك فقط.")
             custom_id = str(payload.get("display_id", "")).strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", custom_id): raise HTTPException(status_code=400, detail="الآيدي المميز يجب أن يكون 3–20 حرفًا/رقمًا أو - _")
-            if any(u.get("id") != user_id and u.get("display_id", u.get("id")) == custom_id for u in platform_state["users"].values()): raise HTTPException(status_code=409, detail="الآيدي المميز مستخدم بالفعل.")
+            if not re.fullmatch(r"\d{8,12}", custom_id): raise HTTPException(status_code=400, detail="الـ ID الموحد يجب أن يكون من 8 إلى 12 رقمًا.")
+            if any(u.get("id") != user_id and str(u.get("display_id", u.get("id"))) == custom_id for u in platform_state["users"].values()): raise HTTPException(status_code=409, detail="هذا الـ ID مستخدم بالفعل؛ اختر رقمًا آخر.")
             target["display_id"] = custom_id
         _platform_audit(actor, "USER_UPDATE", user_id, json.dumps({k: v for k, v in payload.items() if k != "password"}, ensure_ascii=False))
         _platform_save_state()
