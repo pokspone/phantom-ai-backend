@@ -2193,7 +2193,7 @@ _platform_lock = threading.RLock()
 def _platform_default_state() -> Dict[str, Any]:
     return {
         "users": {}, "sessions": {}, "moments": [], "messages": [], "support_messages": [], "reports": [], "predictions": [],
-        "announcements": [], "featured_user_ids": [], "audit": [],
+        "announcements": [], "featured_user_ids": [], "audit": [], "subscription_codes": [],
         "apps": [
             {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
         ],
@@ -2488,7 +2488,7 @@ def platform_users(q: str = "", authorization: Optional[str] = Header(default=No
 
 @app.get("/api/platform/apps")
 def platform_apps(authorization: Optional[str] = Header(default=None)):
-    _platform_find_session(authorization)
+    # Public catalog: do not fail the whole home screen when a stale session token is present.
     apps = [a for a in platform_state.get("apps", []) if str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) or a.get("created_by_admin") is True]
     if not any(str(a.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(a.get("name", "")), re.I) for a in apps):
         apps.insert(0, {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"})
@@ -2679,6 +2679,64 @@ def platform_report_message(message_id: str, payload: Dict[str, Any], authorizat
         platform_state.setdefault("reports", []).append(report); platform_state["reports"] = platform_state["reports"][-1000:]
         _platform_save_state()
     return {"ok": True, "report": report}
+
+
+@app.post("/api/platform/subscription/activate")
+def platform_activate_subscription_code(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    code = re.sub(r"\s+", "", str(payload.get("code", ""))).upper()
+    if not code or len(code) > 80:
+        raise HTTPException(status_code=400, detail="اكتب كود الاشتراك بشكل صحيح.")
+    with _platform_lock:
+        codes = platform_state.setdefault("subscription_codes", [])
+        entry = next((c for c in codes if str(c.get("code", "")).upper() == code), None)
+        if not entry:
+            raise HTTPException(status_code=404, detail="كود الاشتراك غير صحيح.")
+        if entry.get("used_at"):
+            raise HTTPException(status_code=409, detail="الكود مستخدم بالفعل.")
+        days = int(entry.get("days", 0))
+        if days not in (30, 150, 365):
+            raise HTTPException(status_code=400, detail="مدة الاشتراك المرتبطة بالكود غير صالحة.")
+        now = datetime.now(timezone.utc)
+        prior = user.get("vip", {}) if isinstance(user.get("vip"), dict) else {}
+        try:
+            old_exp = datetime.fromisoformat(str(prior.get("expires_at", "")).replace("Z", "+00:00"))
+            if old_exp.tzinfo is None: old_exp = old_exp.replace(tzinfo=timezone.utc)
+        except Exception:
+            old_exp = now
+        start = old_exp if prior.get("active") and old_exp > now else now
+        expiry = datetime.fromtimestamp(start.timestamp() + days * 86400, timezone.utc)
+        user["vip"] = {"active": True, "plan_days": days, "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expiry.isoformat().replace("+00:00", "Z"), "activated_by_code": True}
+        entry["used_at"] = _platform_now()
+        entry["used_by_user_id"] = user.get("id")
+        entry["used_by_username"] = user.get("username")
+        _platform_audit({"id": user.get("id"), "username": user.get("username")}, "VIP_CODE_REDEEMED", user.get("id", ""), f"{days} days")
+        _platform_save_state()
+        return {"ok": True, "message": f"تم تفعيل VIP لمدة {days} يومًا.", "user": _platform_user_public(user)}
+
+
+@app.post("/api/platform/admin/subscription-codes")
+def platform_admin_create_subscription_code(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    try: days = int(payload.get("days", 30))
+    except (TypeError, ValueError): days = 0
+    if days not in (30, 150, 365):
+        raise HTTPException(status_code=400, detail="اختر مدة 30 أو 150 أو 365 يومًا.")
+    code = "PH-VIP-" + secrets.token_hex(5).upper()
+    entry = {"id": secrets.token_hex(8), "code": code, "days": days, "created_at": _platform_now(), "created_by": actor.get("username", "admin"), "used_at": None, "used_by_user_id": None, "used_by_username": None}
+    with _platform_lock:
+        platform_state.setdefault("subscription_codes", []).append(entry)
+        platform_state["subscription_codes"] = platform_state["subscription_codes"][-2000:]
+        _platform_audit(actor, "VIP_CODE_CREATED", entry["id"], f"{days} days")
+        _platform_save_state()
+    return {"ok": True, "code": code, "days": days, "created_at": entry["created_at"], "used": False}
+
+
+@app.get("/api/platform/admin/subscription-codes")
+def platform_admin_list_subscription_codes(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    rows = list(reversed(platform_state.get("subscription_codes", [])[-100:]))
+    return {"ok": True, "codes": rows}
 
 
 @app.post("/api/platform/vip/request")
