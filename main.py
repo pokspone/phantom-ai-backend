@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # إعداد نظام تسجيل الأخطاء والأحداث
@@ -2270,12 +2271,12 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     # Backfill profile fields for accounts created by older builds so the profile UI never receives null/missing fields.
     username = str(user.get("username") or "عضو جديد")
     profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
-    profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": "", "age": "", "gender": "", "country": "", "job": "", "interests": "", "social": ""}
+    profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": "", "age": "", "gender": "", "country": "", "job": "", "interests": "", "social": "", "sound": "", "sound_enabled": True}
     normalized_profile = {**profile_defaults, **profile}
     user["profile"] = normalized_profile
     # One stable public ID is shared across profile, user cards, and admin panel.
     public_id = str(user.get("display_id", "")).strip()
-    if not re.fullmatch(r"\d{8,12}", public_id):
+    if not re.fullmatch(r"\d{1,12}", public_id):
         seed = str(user.get("id") or user.get("username") or username)
         public_id = str(int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) % 900000000 + 100000000)
         while any(other is not user and str(other.get("display_id", "")) == public_id for other in platform_state.get("users", {}).values()):
@@ -2284,8 +2285,15 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     user.setdefault("badges", [])
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
     active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+    days_left = 0
+    if active_vip and vip.get("expires_at"):
+        try:
+            remaining = datetime.fromisoformat(str(vip.get("expires_at")).replace("Z", "+00:00")).timestamp() - time.time()
+            days_left = max(0, math.ceil(remaining / 86400))
+        except Exception:
+            days_left = 0
     return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "username": user.get("username"), "role": user.get("role", "USER"),
-            "profile": normalized_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip},
+            "profile": normalized_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip, "days_left": days_left},
             "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned"))}
 
 
@@ -2340,7 +2348,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v123.7", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v151", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2370,6 +2378,7 @@ def platform_signup(payload: Dict[str, Any]):
                 "vip": {"active": False, "plan_days": 0, "started_at": None, "expires_at": None},
                 "created_at": _platform_now(), "last_active": _platform_now(), "banned": False, "blocked_users": []}
         platform_state["users"][key] = user
+        _platform_seed_owner_sound(user)
         token = secrets.token_urlsafe(40)
         platform_state.setdefault("sessions", {})[hashlib.sha256(token.encode()).hexdigest()] = {"user_key": key, "expires": time.time() + 7 * 86400, "created_at": _platform_now()}
         _platform_audit(user, "USER_SIGNUP", user_id)
@@ -2407,6 +2416,7 @@ def platform_login(payload: Dict[str, Any]):
                 badges.append({"name": "App Owner", "rarity": "legendary"})
             # The configured owner is the sole pinned/featured account.
             platform_state["featured_user_ids"] = [user.get("id")]
+        _platform_seed_owner_sound(user)
         token = secrets.token_urlsafe(40)
         platform_state.setdefault("sessions", {})[hashlib.sha256(token.encode()).hexdigest()] = {"user_key": key, "expires": time.time() + 7 * 86400, "created_at": _platform_now()}
         user["last_active"] = _platform_now()
@@ -2437,12 +2447,112 @@ def _platform_can_animate(user: Dict[str, Any]) -> bool:
     return active and int(vip.get("plan_days", 0) or 0) >= 365
 
 
+PLATFORM_AUDIO_MAX_BYTES = 1536 * 1024
+_PLATFORM_AUDIO_EXT = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/ogg": "ogg", "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav",
+                       "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/m4a": "m4a", "audio/aac": "aac", "audio/webm": "webm"}
+
+
+# v151: default profile sound linked to the app owner account (overridable via env).
+PLATFORM_OWNER_SOUND_URL = os.environ.get("PHANTOM_OWNER_SOUND_URL", "https://files.catbox.moe/j2ogpb.mp3").strip()
+PLATFORM_OWNER_SOUND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media", "owner_profile_sound.mp3")
+PLATFORM_OWNER_SOUND_FLAG = "owner_sound_v151"
+
+
+def _platform_seed_owner_sound(user: Dict[str, Any]) -> bool:
+    """Link the configured owner sound to an OWNER account exactly once.
+
+    The per-user flag means a later admin/owner change or removal is never overwritten."""
+    if not PLATFORM_OWNER_SOUND_URL or user.get("role") != "OWNER" or user.get(PLATFORM_OWNER_SOUND_FLAG):
+        return False
+    profile = user.setdefault("profile", {})
+    profile["sound"] = PLATFORM_OWNER_SOUND_URL
+    profile["sound_enabled"] = True
+    user[PLATFORM_OWNER_SOUND_FLAG] = True
+    return True
+
+
+def _platform_validate_sound_value(sound: Any) -> str:
+    sound = str(sound or "").strip()
+    if not sound:
+        return ""
+    if sound.startswith("data:"):
+        if not re.fullmatch(r"data:audio/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+", sound) or len(sound) > 2_200_000:
+            raise HTTPException(status_code=400, detail="ملف الصوت غير صالح أو أكبر من 1.5 ميجابايت.")
+        return sound
+    if not re.fullmatch(r"https?://\S{4,490}", sound):
+        raise HTTPException(status_code=400, detail="رابط الصوت يجب أن يبدأ بـ https:// ويكون رابطًا مباشرًا للملف.")
+    return sound
+
+
+def _platform_probe_sound_url(url: str) -> Dict[str, Any]:
+    """Fetch the first bytes of a sound URL and report whether it is a playable media file."""
+    url = str(url or "").strip()
+    if not re.fullmatch(r"https?://\S{4,490}", url):
+        raise HTTPException(status_code=400, detail="رابط الصوت يجب أن يبدأ بـ https://")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 PHANTOM-ELITE-SoundCheck", "Range": "bytes=0-63"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            status = resp.status
+            ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip().lower()
+            size_header = resp.headers.get("Content-Range", "") or resp.headers.get("Content-Length", "")
+            head = resp.read(64)
+    except urllib.error.HTTPError as exc:
+        return {"reachable": True, "playable": False, "status": exc.code, "content_type": "", "format": "", "detail": f"الرابط رجّع HTTP {exc.code}"}
+    except Exception as exc:
+        return {"reachable": None, "playable": None, "status": 0, "content_type": "", "format": "", "detail": f"تعذر الوصول للرابط من السيرفر: {type(exc).__name__}"}
+    fmt = ""
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0): fmt = "mp3"
+    elif head[4:8] == b"ftyp": fmt = "mp4/m4a"
+    elif head[:4] == b"OggS": fmt = "ogg"
+    elif head[:4] == b"RIFF": fmt = "wav"
+    elif head[:4] == b"\x1aE\xdf\xa3": fmt = "webm"
+    elif head[:4] == b"fLaC": fmt = "flac"
+    playable = status in (200, 206) and bool(fmt or ctype.startswith("audio/") or ctype in {"video/mp4", "video/webm"})
+    total = ""
+    if "/" in size_header: total = size_header.rsplit("/", 1)[-1]
+    elif size_header.isdigit(): total = size_header
+    return {"reachable": True, "playable": playable, "status": status, "content_type": ctype, "format": fmt, "size_bytes": int(total) if str(total).isdigit() else None,
+            "detail": "الرابط شغال وملف صوت صالح" if playable else "الرابط لا يشير إلى ملف صوت مباشر"}
+
+
+def _platform_can_profile_sound(user: Dict[str, Any]) -> bool:
+    if user.get("role") in {"OWNER", "ADMIN"}: return True
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
+    return bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+
+
+def _platform_upload_audio(user: Dict[str, Any], mime: str, encoded: str, admin_override: bool = False) -> Dict[str, Any]:
+    """Profile sound upload. Uses the same Supabase Storage bucket (phantom-media) as images."""
+    if not admin_override and not _platform_can_profile_sound(user):
+        raise HTTPException(status_code=403, detail="صوت البروفايل متاح للمالك والإدارة ومشتركي VIP.")
+    try: raw = base64.b64decode(encoded, validate=True)
+    except Exception: raise HTTPException(status_code=400, detail="بيانات ملف الصوت غير صالحة.")
+    if not raw or len(raw) > PLATFORM_AUDIO_MAX_BYTES: raise HTTPException(status_code=413, detail="ملف الصوت يجب ألا يتجاوز 1.5 ميجابايت.")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        # Development fallback only; configure Supabase Storage for durable hosted media.
+        return {"ok": True, "url": f"data:{mime};base64,{encoded}", "storage": "inline_local_fallback"}
+    object_path = f"users/{user.get('id')}/sound-{secrets.token_hex(10)}.{_PLATFORM_AUDIO_EXT.get(mime, 'mp3')}"
+    url = f"{SUPABASE_URL}/storage/v1/object/phantom-media/{object_path}"
+    headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "Content-Type": mime, "x-upsert": "false"}
+    req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status not in (200, 201): raise RuntimeError(f"Storage HTTP {resp.status}")
+        return {"ok": True, "url": f"{SUPABASE_URL}/storage/v1/object/public/phantom-media/{object_path}", "storage": "supabase_storage"}
+    except Exception as exc:
+        logger.error("Platform audio upload failed: %s", exc)
+        raise HTTPException(status_code=502, detail="تعذر رفع ملف الصوت إلى التخزين. تأكد من وجود bucket باسم phantom-media.")
+
+
 @app.post("/api/platform/media/upload")
 def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
     data_url = str(payload.get("data_url", ""))
+    audio_match = re.fullmatch(r"data:(audio/(?:mpeg|mp3|ogg|wav|x-wav|wave|mp4|x-m4a|m4a|aac|webm));base64,([A-Za-z0-9+/=]+)", data_url)
+    if audio_match:
+        return _platform_upload_audio(user, *audio_match.groups())
     match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", data_url)
-    if not match: raise HTTPException(status_code=400, detail="صيغة الصورة غير مدعومة. استخدم JPG أو PNG أو WEBP أو GIF.")
+    if not match: raise HTTPException(status_code=400, detail="صيغة الملف غير مدعومة. الصور: JPG أو PNG أو WEBP أو GIF — الصوت: MP3 أو OGG أو WAV أو M4A.")
     mime, encoded = match.groups()
     if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP3 السنوي فقط.")
     try: raw = base64.b64decode(encoded, validate=True)
@@ -2476,6 +2586,16 @@ def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str
     user = _platform_find_session(authorization)
     allowed = {"display_name", "bio", "avatar", "banner", "city", "governorate", "relationship", "age", "gender", "country", "job", "interests", "social"}
     profile = user.setdefault("profile", {})
+    if "sound" in payload:
+        sound = str(payload.get("sound") or "").strip()
+        if sound and sound != str(profile.get("sound") or ""):
+            if not _platform_can_profile_sound(user):
+                raise HTTPException(status_code=403, detail="صوت البروفايل متاح للمالك والإدارة ومشتركي VIP.")
+            sound = _platform_validate_sound_value(sound)
+        profile["sound"] = sound
+    if "sound_enabled" in payload:
+        # The account holder can mute/unmute their own profile sound without deleting it.
+        profile["sound_enabled"] = bool(payload.get("sound_enabled"))
     for field in allowed:
         if field in payload:
             value = str(payload[field] or "").strip()
@@ -2502,7 +2622,7 @@ def platform_users(q: str = "", authorization: Optional[str] = Header(default=No
     q = q.strip().casefold()
     with _platform_lock:
         values = [_platform_user_public(u) for u in platform_state.get("users", {}).values()
-                  if (not q or q in str(u.get("username", "")).casefold() or q in str(u.get("id", "")).casefold()) and not u.get("banned")]
+                  if (not q or q in str(u.get("username", "")).casefold() or q in str(u.get("id", "")).casefold() or q == str(u.get("display_id", ""))) and not u.get("banned")]
         values.sort(key=lambda u: (u.get("id") != next((x.get("id") for x in platform_state["users"].values() if x.get("role") == "OWNER"), None), u.get("username", "").casefold()))
         featured = platform_state.get("featured_user_ids", [])
         values.sort(key=lambda u: (u.get("role") != "OWNER", u.get("id") not in featured, u.get("username", "").casefold()))
@@ -2538,9 +2658,17 @@ def platform_presence_online():
         count = len(_platform_presence)
     return {"ok": True, "online_count": count, "window_seconds": 90, "source": "authenticated_heartbeats"}
 
+@app.get("/api/platform/media/owner-sound.mp3")
+def platform_owner_sound_file():
+    """Bundled MP3 copy of the owner sound (fallback for browsers that cannot play the original link)."""
+    if not os.path.isfile(PLATFORM_OWNER_SOUND_FILE):
+        raise HTTPException(status_code=404, detail="ملف صوت المالك غير موجود على السيرفر.")
+    return FileResponse(PLATFORM_OWNER_SOUND_FILE, media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/api/platform/health")
 def platform_health():
-    return {"ok": True, "service": "PHANTOM ELITE", "release": "v135", "catalog": True}
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v151", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
 
 
 @app.get("/api/platform/apps")
@@ -2845,61 +2973,275 @@ def platform_admin_users(q: str = "", authorization: Optional[str] = Header(defa
     return {"ok": True, "users": users[:500]}
 
 
+def _platform_find_user_entry(ref: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Find a user by internal id, username or public display ID. Returns (storage_key, user)."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return None, None
+    users = platform_state.get("users", {})
+    for key, u in users.items():
+        if u.get("id") == ref:
+            return key, u
+    for key, u in users.items():
+        if str(u.get("username", "")).casefold() == ref.casefold():
+            return key, u
+    for key, u in users.items():
+        if str(u.get("display_id", "")) == ref:
+            return key, u
+    return None, None
+
+
+def _platform_guard_target(actor: Dict[str, Any], target: Dict[str, Any]) -> None:
+    """Shared protection rules for every admin change to another account."""
+    if target.get("role") == "OWNER" and actor.get("role") != "OWNER":
+        raise HTTPException(status_code=403, detail="لا يمكن تعديل حساب المالك إلا بواسطة المالك.")
+    if target.get("role") == "ADMIN" and actor.get("role") != "OWNER" and actor.get("id") != target.get("id"):
+        raise HTTPException(status_code=403, detail="تعديل حسابات الأدمن متاح للمالك فقط.")
+
+
+PLATFORM_ADMIN_PROFILE_FIELDS = {"display_name", "bio", "city", "governorate", "relationship", "age", "gender", "country", "job", "interests", "social", "avatar", "banner"}
+
+
 @app.patch("/api/platform/admin/users/{user_id}")
 def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     actor = _platform_require_admin(authorization)
     with _platform_lock:
-        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id), None)
+        target_key, target = _platform_find_user_entry(user_id)
         if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-        if target.get("role") == "OWNER" and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="لا يمكن تعديل حساب المالك إلا بواسطة المالك.")
-        if "banned" in payload: target["banned"] = bool(payload["banned"])
+        user_id = str(target.get("id"))
+        _platform_guard_target(actor, target)
+        is_owner_target = target.get("role") == "OWNER"
+        is_self = actor.get("id") == target.get("id")
+        # ---- validate everything first, then apply (no half-applied edits) ----
+        changes: Dict[str, Any] = {}
+        if "banned" in payload:
+            banned = bool(payload["banned"])
+            if banned and (is_owner_target or is_self): raise HTTPException(status_code=403, detail="لا يمكن حظر حساب المالك أو حظر حسابك الحالي.")
+            changes["banned"] = banned
         if "role" in payload:
             role = str(payload["role"]).upper()
             if role not in {"USER", "MODERATOR", "ADMIN", "OWNER"}: raise HTTPException(status_code=400, detail="الدور غير مسموح.")
             if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تعيين الأدوار الحساسة للمالك فقط.")
-            target["role"] = role
-        if "featured" in payload:
-            featured = platform_state.setdefault("featured_user_ids", [])
-            if bool(payload["featured"]) and user_id not in featured: featured.append(user_id)
-            if not bool(payload["featured"]) and user_id in featured: featured.remove(user_id)
-        if "badges" in payload and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="إدارة الشارات للمالك فقط.")
-        if "badges" in payload and actor.get("role") == "OWNER":
-            badges = payload["badges"] if isinstance(payload["badges"], list) else []
-            target["badges"] = [{"name": str(b.get("name", ""))[:60], "rarity": str(b.get("rarity", "rare"))[:30]} for b in badges[:50] if isinstance(b, dict) and str(b.get("name", "")).strip()]
+            if is_owner_target and role != "OWNER": raise HTTPException(status_code=403, detail="حساب المالك محمي؛ لا يمكن تنزيل صلاحياته من لوحة التحكم.")
+            if is_self and role != target.get("role"): raise HTTPException(status_code=403, detail="لا يمكنك تغيير صلاحيات حسابك الحالي.")
+            changes["role"] = role
+        if "username" in payload:
+            new_username = str(payload.get("username", "")).strip()
+            if new_username != target.get("username"):
+                if is_owner_target: raise HTTPException(status_code=403, detail="اسم مستخدم المالك محمي لأنه مرتبط بإعدادات السيرفر.")
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{3,24}", new_username): raise HTTPException(status_code=400, detail="اسم المستخدم يجب أن يكون 3–24 حرفًا إنجليزيًا أو رقمًا أو . _ -")
+                new_key = new_username.casefold()
+                if new_key != target_key and new_key in platform_state.get("users", {}): raise HTTPException(status_code=409, detail="اسم المستخدم مستخدم بالفعل.")
+                changes["username"] = new_username
+        if "password" in payload and str(payload.get("password") or ""):
+            password = str(payload.get("password"))
+            if is_owner_target and not is_self: raise HTTPException(status_code=403, detail="كلمة مرور المالك لا تُغيَّر من لوحة التحكم.")
+            if is_owner_target and actor.get("id") == "SERVER-OWNER": raise HTTPException(status_code=403, detail="كلمة مرور المالك لا تُغيَّر من لوحة التحكم.")
+            if len(password) < 8 or len(password) > 128: raise HTTPException(status_code=400, detail="كلمة المرور يجب ألا تقل عن 8 أحرف.")
+            changes["password"] = password
+        profile_changes: Dict[str, str] = {}
+        prof_payload = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+        for field in PLATFORM_ADMIN_PROFILE_FIELDS:
+            if field in prof_payload:
+                value = str(prof_payload[field] or "").strip()
+                limit = 1_500_000 if field in {"avatar", "banner"} else 500
+                if len(value) > limit: raise HTTPException(status_code=400, detail=f"القيمة طويلة جدًا للحقل {field}.")
+                if field == "age" and value and (not value.isdigit() or not (13 <= int(value) <= 99)): raise HTTPException(status_code=400, detail="السن يجب أن يكون رقمًا بين 13 و99.")
+                if field == "gender" and value not in {"", "ذكر", "أنثى"}: raise HTTPException(status_code=400, detail="قيمة النوع غير صالحة.")
+                profile_changes[field] = value
         if "display_id" in payload:
             if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تخصيص الآيدي المميز للمالك فقط.")
             custom_id = str(payload.get("display_id", "")).strip()
-            if not re.fullmatch(r"\d{8,12}", custom_id): raise HTTPException(status_code=400, detail="الـ ID الموحد يجب أن يكون من 8 إلى 12 رقمًا.")
-            if any(u.get("id") != user_id and str(u.get("display_id", u.get("id"))) == custom_id for u in platform_state["users"].values()): raise HTTPException(status_code=409, detail="هذا الـ ID مستخدم بالفعل؛ اختر رقمًا آخر.")
-            target["display_id"] = custom_id
-        _platform_audit(actor, "USER_UPDATE", user_id, json.dumps({k: v for k, v in payload.items() if k != "password"}, ensure_ascii=False))
+            if not re.fullmatch(r"\d{1,12}", custom_id) or int(custom_id) == 0: raise HTTPException(status_code=400, detail="الـ ID يجب أن يكون أرقامًا فقط (من 1 إلى 12 رقمًا) مثل 111.")
+            for u in platform_state["users"].values():
+                if u is target: continue
+                if str(_platform_user_public(u).get("display_id")) == custom_id or str(u.get("id")) == custom_id:
+                    raise HTTPException(status_code=409, detail="هذا الـ ID مستخدم بالفعل؛ اختر رقمًا آخر.")
+            changes["display_id"] = custom_id
+        if "featured" in payload:
+            changes["featured"] = bool(payload["featured"])
+        if "badges" in payload and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="إدارة الشارات للمالك فقط.")
+        # ---- apply ----
+        audit_payload = {k: v for k, v in payload.items() if k not in {"password"}}
+        if "password" in changes: audit_payload["password"] = "(reset)"
+        if "banned" in changes: target["banned"] = changes["banned"]
+        if "role" in changes: target["role"] = changes["role"]
+        if "featured" in changes:
+            featured = platform_state.setdefault("featured_user_ids", [])
+            if changes["featured"] and user_id not in featured: featured.append(user_id)
+            if not changes["featured"] and user_id in featured: featured.remove(user_id)
+        if "badges" in payload and actor.get("role") == "OWNER":
+            badges = payload["badges"] if isinstance(payload["badges"], list) else []
+            target["badges"] = [{"name": str(b.get("name", ""))[:60], "rarity": str(b.get("rarity", "rare"))[:30]} for b in badges[:50] if isinstance(b, dict) and str(b.get("name", "")).strip()]
+        if "display_id" in changes: target["display_id"] = changes["display_id"]
+        if profile_changes: target.setdefault("profile", {}).update(profile_changes)
+        if "password" in changes:
+            salt, digest = _platform_password_hash(changes["password"])
+            target["password_salt"], target["password_hash"] = salt, digest
+            # Force re-login everywhere after an admin password reset.
+            sessions = platform_state.get("sessions", {})
+            for h in [h for h, sess in sessions.items() if sess.get("user_key") == target_key]: sessions.pop(h, None)
+        if "username" in changes:
+            new_key = changes["username"].casefold()
+            target["username"] = changes["username"]
+            if new_key != target_key:
+                users = platform_state["users"]
+                users[new_key] = users.pop(target_key)
+                for sess in platform_state.get("sessions", {}).values():
+                    if sess.get("user_key") == target_key: sess["user_key"] = new_key
+                target_key = new_key
+        if changes.get("banned"):
+            sessions = platform_state.get("sessions", {})
+            for h in [h for h, sess in sessions.items() if sess.get("user_key") == target_key]: sessions.pop(h, None)
+        _platform_audit(actor, "USER_UPDATE", user_id, json.dumps(audit_payload, ensure_ascii=False)[:500])
+        _platform_save_state()
+        return {"ok": True, "user": _platform_user_public(target)}
+
+
+@app.delete("/api/platform/admin/users/{user_id}")
+def platform_admin_delete_user(user_id: str, confirm: str = "", authorization: Optional[str] = Header(default=None)):
+    """Permanently delete an account. Requires confirm=<exact username>; the owner account can never be deleted."""
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        target_key, target = _platform_find_user_entry(user_id)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود أو تم حذفه بالفعل.")
+        if target.get("role") == "OWNER": raise HTTPException(status_code=403, detail="حساب المالك محمي ولا يمكن حذفه.")
+        if actor.get("id") == target.get("id"): raise HTTPException(status_code=403, detail="لا يمكنك حذف حسابك الحالي.")
+        if target.get("role") == "ADMIN" and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="حذف حسابات الأدمن متاح للمالك فقط.")
+        if str(confirm or "").strip().casefold() != str(target.get("username", "")).casefold():
+            raise HTTPException(status_code=400, detail="للتأكيد اكتب اسم المستخدم بالضبط قبل الحذف.")
+        uid = str(target.get("id"))
+        platform_state["users"].pop(target_key, None)
+        sessions = platform_state.get("sessions", {})
+        removed_sessions = [h for h, sess in sessions.items() if sess.get("user_key") == target_key]
+        for h in removed_sessions: sessions.pop(h, None)
+        featured = platform_state.get("featured_user_ids", [])
+        if uid in featured: featured.remove(uid)
+        before = len(platform_state.get("moments", []))
+        platform_state["moments"] = [m for m in platform_state.get("moments", []) if m.get("user_id") != uid]
+        removed_moments = before - len(platform_state["moments"])
+        for r in platform_state.get("vip_requests", []):
+            if r.get("user_id") == uid and r.get("status") == "pending": r["status"] = "cancelled_user_deleted"
+        for u in platform_state.get("users", {}).values():
+            if uid in (u.get("blocked_users") or []): u["blocked_users"] = [x for x in u["blocked_users"] if x != uid]
+        _platform_audit(actor, "USER_DELETE", uid, f"@{target.get('username')} • ID {target.get('display_id')} • sessions={len(removed_sessions)} • moments={removed_moments}")
+        _platform_save_state()
+    with _platform_presence_lock:
+        _platform_presence.pop(uid, None)
+    return {"ok": True, "deleted": {"id": uid, "username": target.get("username"), "display_id": target.get("display_id"), "sessions_revoked": len(removed_sessions), "moments_removed": removed_moments}}
+
+
+@app.get("/api/platform/admin/sound/check")
+def platform_admin_sound_check(url: str = "", authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    return {"ok": True, "check": _platform_probe_sound_url(url)}
+
+
+@app.post("/api/platform/admin/users/{user_id}/sound")
+def platform_admin_set_sound(user_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    """Assign/replace a user's profile sound (https link or uploaded data URL) and/or toggle it on/off."""
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        _, target = _platform_find_user_entry(user_id)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        _platform_guard_target(actor, target)
+    check = None
+    new_sound: Optional[str] = None
+    data_url = str(payload.get("data_url") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    if data_url:
+        match = re.fullmatch(r"data:(audio/(?:mpeg|mp3|ogg|wav|x-wav|wave|mp4|x-m4a|m4a|aac|webm));base64,([A-Za-z0-9+/=]+)", data_url)
+        if not match: raise HTTPException(status_code=400, detail="صيغة ملف الصوت غير مدعومة (MP3 / OGG / WAV / M4A).")
+        new_sound = _platform_upload_audio(target, *match.groups(), admin_override=True)["url"]
+    elif url:
+        new_sound = _platform_validate_sound_value(url)
+        if payload.get("verify", True):
+            check = _platform_probe_sound_url(new_sound)
+            if check.get("playable") is False:
+                raise HTTPException(status_code=400, detail=f"الرابط غير صالح كملف صوت: {check.get('detail')}")
+    with _platform_lock:
+        _, target = _platform_find_user_entry(user_id)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        profile = target.setdefault("profile", {})
+        if new_sound is not None: profile["sound"] = new_sound
+        if "sound_enabled" in payload: profile["sound_enabled"] = bool(payload.get("sound_enabled"))
+        elif new_sound is not None: profile["sound_enabled"] = True
+        _platform_audit(actor, "USER_SOUND_SET", str(target.get("id")), (new_sound or "")[:200] + f" • enabled={profile.get('sound_enabled', True)}")
+        _platform_save_state()
+        return {"ok": True, "user": _platform_user_public(target), "check": check}
+
+
+@app.delete("/api/platform/admin/users/{user_id}/sound")
+def platform_admin_delete_sound(user_id: str, authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        _, target = _platform_find_user_entry(user_id)
+        if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        _platform_guard_target(actor, target)
+        target.setdefault("profile", {})["sound"] = ""
+        _platform_audit(actor, "USER_SOUND_DELETE", str(target.get("id")))
         _platform_save_state()
         return {"ok": True, "user": _platform_user_public(target)}
 
 
 @app.post("/api/platform/admin/vip")
 def platform_admin_vip(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    """Subscription control with any number of days.
+
+    mode: set (exactly N days from now) | extend (add N days, default) | reduce (remove N days) | cancel."""
     actor = _platform_require_admin(authorization)
     user_id = str(payload.get("user_id", "")).strip()
-    days = int(payload.get("days", 30))
-    active = bool(payload.get("active", True))
-    if days not in (30, 150, 365, 0): raise HTTPException(status_code=400, detail="المدة يجب أن تكون 30 أو 150 أو 365 يومًا أو 0 للإلغاء.")
+    mode = str(payload.get("mode", "extend")).strip().lower()
+    try: days = int(payload.get("days", 30))
+    except Exception: raise HTTPException(status_code=400, detail="عدد الأيام يجب أن يكون رقمًا صحيحًا.")
+    if payload.get("active") is False or (days == 0 and mode != "cancel"): mode = "cancel"
+    if mode not in {"set", "extend", "reduce", "cancel"}: raise HTTPException(status_code=400, detail="نوع العملية غير معروف (set / extend / reduce / cancel).")
+    if mode != "cancel" and not (1 <= days <= 36500): raise HTTPException(status_code=400, detail="عدد الأيام يجب أن يكون بين 1 و36500 يوم.")
     with _platform_lock:
-        target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id or u.get("username", "").casefold() == user_id.casefold()), None)
+        _, target = _platform_find_user_entry(user_id)
         if not target: raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        if target.get("role") == "OWNER" and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="لا يمكن تعديل حساب المالك إلا بواسطة المالك.")
         now = datetime.now(timezone.utc)
-        if not active or days == 0:
+        iso = lambda d: d.isoformat().replace("+00:00", "Z")
+        prior = target.get("vip") if isinstance(target.get("vip"), dict) else {}
+        try: old_exp = datetime.fromisoformat(str(prior.get("expires_at", "")).replace("Z", "+00:00"))
+        except Exception: old_exp = None
+        currently_active = bool(prior.get("active") and old_exp and old_exp > now)
+        prior_days = int(prior.get("plan_days", 0) or 0) if currently_active else 0
+        note = ""
+        if mode == "cancel":
             target["vip"] = {"active": False, "plan_days": 0, "started_at": None, "expires_at": None}
-        else:
-            prior = target.get("vip", {})
-            try: old_exp = datetime.fromisoformat(str(prior.get("expires_at", "")).replace("Z", "+00:00"))
-            except Exception: old_exp = now
-            start = old_exp if prior.get("active") and old_exp > now else now
-            expiry = datetime.fromtimestamp(start.timestamp() + days * 86400, timezone.utc)
-            target["vip"] = {"active": True, "plan_days": days, "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expiry.isoformat().replace("+00:00", "Z")}
-        _platform_audit(actor, "VIP_UPDATE", user_id, json.dumps(target["vip"], ensure_ascii=False))
+        elif mode == "set":
+            target["vip"] = {"active": True, "plan_days": days, "started_at": iso(now), "expires_at": iso(datetime.fromtimestamp(now.timestamp() + days * 86400, timezone.utc))}
+        elif mode == "extend":
+            base = old_exp if currently_active else now
+            target["vip"] = {"active": True, "plan_days": prior_days + days, "started_at": prior.get("started_at") if currently_active else iso(now),
+                             "expires_at": iso(datetime.fromtimestamp(base.timestamp() + days * 86400, timezone.utc))}
+        else:  # reduce
+            if not currently_active: raise HTTPException(status_code=400, detail="لا يوجد اشتراك نشط لتقليص مدته.")
+            new_exp = datetime.fromtimestamp(old_exp.timestamp() - days * 86400, timezone.utc)
+            if new_exp <= now:
+                target["vip"] = {"active": False, "plan_days": 0, "started_at": None, "expires_at": None}
+                note = "المدة المخصومة أكبر من المتبقي؛ تم إنهاء الاشتراك."
+            else:
+                target["vip"] = {"active": True, "plan_days": max(1, prior_days - days), "started_at": prior.get("started_at"), "expires_at": iso(new_exp)}
+        _platform_audit(actor, "VIP_UPDATE", str(target.get("id")), json.dumps({"mode": mode, "days": days, **target["vip"]}, ensure_ascii=False))
         _platform_save_state()
-        return {"ok": True, "user": _platform_user_public(target)}
+        return {"ok": True, "mode": mode, "note": note, "user": _platform_user_public(target)}
+
+
+def _platform_startup_owner_sound() -> None:
+    try:
+        with _platform_lock:
+            changed = [u for u in platform_state.get("users", {}).values() if _platform_seed_owner_sound(u)]
+            if changed:
+                _platform_save_state()
+                logger.info("Owner profile sound linked to %d owner account(s)", len(changed))
+    except Exception as exc:
+        logger.error("Owner sound seeding skipped: %s", exc)
+
+
+_platform_startup_owner_sound()
 
 
 @app.get("/api/platform/admin/vip-requests")
