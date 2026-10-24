@@ -87,7 +87,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_OxyjnNeEhj3G1Mpmgn
 ADMIN_SECRET = os.environ.get("PHANTOM_ADMIN_PASS", "").strip()
 LEARNING_FILE_PATH = _storage_path("PHANTOM_LEARNING_FILE", "phantom_learning.json")
 # Durable learning storage: use a server-only Supabase secret when configured.
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
 LEARNING_TABLE = os.environ.get("PHANTOM_LEARNING_TABLE", "phantom_learning_records")
 RESELLER_TABLE = os.environ.get("PHANTOM_RESELLER_TABLE", "phantom_reseller_state")
 _learning_lock = threading.RLock()
@@ -2541,7 +2541,7 @@ def _platform_upload_audio(user: Dict[str, Any], mime: str, encoded: str, admin_
         return {"ok": True, "url": f"{SUPABASE_URL}/storage/v1/object/public/phantom-media/{object_path}", "storage": "supabase_storage"}
     except Exception as exc:
         logger.error("Platform audio upload failed: %s", exc)
-        raise HTTPException(status_code=502, detail="تعذر رفع ملف الصوت إلى التخزين. تأكد من وجود bucket باسم phantom-media.")
+        raise HTTPException(status_code=502, detail="تعذر رفع ملف الصوت إلى Supabase Storage. تحقق من مفتاح السيرفر وعنوان المشروع وbucket باسم phantom-media؛ راجع سجل الاستضافة لمعرفة رمز HTTP.")
 
 
 @app.post("/api/platform/media/upload")
@@ -2574,12 +2574,25 @@ def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/phantom-media/{object_path}"
         return {"ok": True, "url": public_url, "storage": "supabase_storage"}
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:400]
-        logger.error("Platform media upload failed: %s", detail)
-        raise HTTPException(status_code=502, detail="تعذر رفع الصورة إلى Supabase Storage. تأكد من إنشاء bucket باسم phantom-media.")
+        detail = exc.read().decode("utf-8", errors="ignore")[:500]
+        logger.error("Platform media upload failed (HTTP %s): %s", exc.code, detail)
+        # Return actionable, non-secret diagnostics so the client/logs identify the real Storage issue.
+        if exc.code == 400:
+            message = "رفض Supabase الصورة (400). تحقق من أنواع الملفات المسموحة وحد الحجم في إعدادات phantom-media."
+        elif exc.code == 401:
+            message = "مفتاح Supabase غير صالح أو ليس مفتاح سيرفر. اضبط SUPABASE_SERVICE_ROLE_KEY أو SUPABASE_SECRET_KEY في إعدادات الاستضافة ثم أعد التشغيل."
+        elif exc.code == 403:
+            message = "Supabase رفض صلاحية الرفع (403). استخدم مفتاح السيرفر الصحيح وتأكد من أن عنوان SUPABASE_URL يخص نفس المشروع الذي يحتوي phantom-media."
+        elif exc.code == 404:
+            message = "لم يعثر Supabase على bucket phantom-media في المشروع المحدد. تحقق من الاسم حرفيًا ومن SUPABASE_URL."
+        elif exc.code == 413:
+            message = "Supabase رفض الملف لأنه أكبر من الحد المسموح في إعدادات Storage."
+        else:
+            message = f"فشل رفع الصورة إلى Supabase Storage (HTTP {exc.code}). راجع سجل الاستضافة لمعرفة التفاصيل."
+        raise HTTPException(status_code=502, detail=message)
     except Exception as exc:
         logger.error("Platform media upload failed: %s", exc)
-        raise HTTPException(status_code=502, detail="فشل رفع الصورة إلى التخزين الدائم.")
+        raise HTTPException(status_code=502, detail="تعذر الاتصال بـ Supabase Storage. تحقق من اتصال السيرفر وعنوان SUPABASE_URL.")
 
 
 @app.patch("/api/platform/profile")
