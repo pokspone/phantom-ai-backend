@@ -2198,7 +2198,7 @@ def _platform_default_state() -> Dict[str, Any]:
         "apps": [
             {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
         ],
-        "settings": {"app_name": "PHANTOM ELITE", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "chat_enabled": True, "moments_enabled": True},
+        "settings": {"app_name": "PHANTOM ELITE", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "vip_plans": {"vip1": {"name":"VIP 1", "days":30, "price_egp":150, "price_usd":150, "active":True, "features":["شارة VIP","تحليلات موسعة","أولوية الدعم"]}, "vip2": {"name":"VIP 2", "days":150, "price_egp":500, "price_usd":500, "active":True, "features":["كل مزايا VIP 1","صور متحركة حتى 5 ميجابايت"]}, "vip3": {"name":"VIP 3", "days":365, "price_egp":1000, "price_usd":1000, "active":True, "features":["كل مزايا VIP 2","صور متحركة حتى 5 ميجابايت","أولوية الدعم"]}}, "chat_enabled": True, "moments_enabled": True},
     }
 
 
@@ -2441,10 +2441,10 @@ def platform_me(authorization: Optional[str] = Header(default=None)):
 
 
 def _platform_can_animate(user: Dict[str, Any]) -> bool:
-    if user.get("role") == "OWNER": return True
+    if user.get("role") in {"OWNER", "ADMIN"}: return True
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
     active = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
-    return active and int(vip.get("plan_days", 0) or 0) >= 365
+    return active and (str(vip.get("plan_id", "")).lower() in {"vip2", "vip3"} or int(vip.get("plan_days", 0) or 0) >= 150)
 
 
 PLATFORM_AUDIO_MAX_BYTES = 1536 * 1024
@@ -2554,10 +2554,11 @@ def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] 
     match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", data_url)
     if not match: raise HTTPException(status_code=400, detail="صيغة الملف غير مدعومة. الصور: JPG أو PNG أو WEBP أو GIF — الصوت: MP3 أو OGG أو WAV أو M4A.")
     mime, encoded = match.groups()
-    if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP3 السنوي فقط.")
+    if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP 2 وVIP 3 فقط.")
     try: raw = base64.b64decode(encoded, validate=True)
     except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
-    if not raw or len(raw) > 950 * 1024: raise HTTPException(status_code=413, detail="حجم الصورة يجب ألا يتجاوز 950 كيلوبايت.")
+    max_bytes = 5 * 1024 * 1024 if mime == "image/gif" else 950 * 1024
+    if not raw or len(raw) > max_bytes: raise HTTPException(status_code=413, detail="حجم الصورة المتحركة يجب ألا يتجاوز 5 ميجابايت." if mime == "image/gif" else "حجم الصورة العادية يجب ألا يتجاوز 950 كيلوبايت.")
     if not SUPABASE_SERVICE_ROLE_KEY:
         # Development fallback only; configure Supabase Storage for durable hosted media.
         return {"ok": True, "url": data_url, "storage": "inline_local_fallback"}
@@ -2599,10 +2600,20 @@ def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str
     for field in allowed:
         if field in payload:
             value = str(payload[field] or "").strip()
-            if field in {"avatar", "banner"} and value.startswith("data:image/gif") and not _platform_can_animate(user):
-                raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP3 السنوي فقط.")
-            if field in {"avatar", "banner"} and len(value) > 1_500_000:
-                raise HTTPException(status_code=413, detail="الصورة كبيرة جدًا؛ الحد الأقصى 1.5 ميجابايت.")
+            if field in {"avatar", "banner"} and value.startswith("data:"):
+                data_match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", value)
+                if not data_match:
+                    raise HTTPException(status_code=400, detail="صيغة الصورة غير مدعومة. استخدم JPG أو PNG أو WEBP أو GIF.")
+                data_mime, data_encoded = data_match.groups()
+                if data_mime == "image/gif" and not _platform_can_animate(user):
+                    raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP 2 وVIP 3 فقط.")
+                try: data_raw = base64.b64decode(data_encoded, validate=True)
+                except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
+                data_limit = 5 * 1024 * 1024 if data_mime == "image/gif" else 950 * 1024
+                if not data_raw or len(data_raw) > data_limit:
+                    raise HTTPException(status_code=413, detail="الصورة المتحركة يجب ألا تتجاوز 5 ميجابايت." if data_mime == "image/gif" else "الصورة العادية يجب ألا تتجاوز 950 كيلوبايت.")
+            if field in {"avatar", "banner"} and len(value) > 7_200_000:
+                raise HTTPException(status_code=413, detail="الصورة كبيرة جدًا؛ الحد الأقصى 5 ميجابايت للصور المتحركة.")
             if field not in {"avatar", "banner"} and len(value) > 500:
                 raise HTTPException(status_code=400, detail=f"القيمة طويلة جدًا للحقل {field}.")
             if field == "age" and value:
@@ -2899,7 +2910,7 @@ def platform_activate_subscription_code(payload: Dict[str, Any], authorization: 
         if entry.get("used_at"):
             raise HTTPException(status_code=409, detail="الكود مستخدم بالفعل.")
         days = int(entry.get("days", 0))
-        if days not in (30, 150, 365):
+        if not 1 <= days <= 36500:
             raise HTTPException(status_code=400, detail="مدة الاشتراك المرتبطة بالكود غير صالحة.")
         now = datetime.now(timezone.utc)
         prior = user.get("vip", {}) if isinstance(user.get("vip"), dict) else {}
@@ -2910,7 +2921,7 @@ def platform_activate_subscription_code(payload: Dict[str, Any], authorization: 
             old_exp = now
         start = old_exp if prior.get("active") and old_exp > now else now
         expiry = datetime.fromtimestamp(start.timestamp() + days * 86400, timezone.utc)
-        user["vip"] = {"active": True, "plan_days": days, "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expiry.isoformat().replace("+00:00", "Z"), "activated_by_code": True}
+        user["vip"] = {"active": True, "plan_days": days, "plan_id": entry.get("plan_id"), "plan_name": entry.get("plan_name"), "started_at": now.isoformat().replace("+00:00", "Z"), "expires_at": expiry.isoformat().replace("+00:00", "Z"), "activated_by_code": True}
         entry["used_at"] = _platform_now()
         entry["used_by_user_id"] = user.get("id")
         entry["used_by_username"] = user.get("username")
@@ -2924,10 +2935,14 @@ def platform_admin_create_subscription_code(payload: Dict[str, Any], authorizati
     actor = _platform_require_admin(authorization)
     try: days = int(payload.get("days", 30))
     except (TypeError, ValueError): days = 0
-    if days not in (30, 150, 365):
-        raise HTTPException(status_code=400, detail="اختر مدة 30 أو 150 أو 365 يومًا.")
+    if not 1 <= days <= 36500:
+        raise HTTPException(status_code=400, detail="اختر مدة بين يوم واحد و36500 يوم.")
+    plan_id = str(payload.get("plan_id", "")).lower()
+    plans = platform_state.setdefault("settings", {}).setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+    plan = plans.get(plan_id) if plan_id else None
+    if plan_id and (not isinstance(plan, dict) or not plan.get("active", True) or int(plan.get("days", 0)) != days): raise HTTPException(status_code=400, detail="الباقة غير متاحة أو تغيرت.")
     code = "PH-VIP-" + secrets.token_hex(5).upper()
-    entry = {"id": secrets.token_hex(8), "code": code, "days": days, "created_at": _platform_now(), "created_by": actor.get("username", "admin"), "used_at": None, "used_by_user_id": None, "used_by_username": None}
+    entry = {"id": secrets.token_hex(8), "code": code, "plan_id": plan_id or None, "plan_name": plan.get("name") if plan else None, "days": days, "created_at": _platform_now(), "created_by": actor.get("username", "admin"), "used_at": None, "used_by_user_id": None, "used_by_username": None}
     with _platform_lock:
         platform_state.setdefault("subscription_codes", []).append(entry)
         platform_state["subscription_codes"] = platform_state["subscription_codes"][-2000:]
@@ -2943,14 +2958,76 @@ def platform_admin_list_subscription_codes(authorization: Optional[str] = Header
     return {"ok": True, "codes": rows}
 
 
-@app.post("/api/platform/vip/request")
-def platform_vip_request(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+@app.get("/api/platform/vip/plans")
+def platform_vip_plans(request: Request, authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
-    days = int(payload.get("days", 30))
-    if days not in (30, 150, 365): raise HTTPException(status_code=400, detail="خطة الاشتراك غير مدعومة.")
+    settings = platform_state.setdefault("settings", {})
+    plans = settings.setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+    country = (request.headers.get("cf-ipcountry") or "").upper()
+    if not country:
+        country = "EG" if str((user.get("profile") or {}).get("country", "")).strip().lower() in {"egypt", "مصر", "eg", "egy"} else "US"
+    currency = "EGP" if country == "EG" else "USD"
+    result = []
+    for key, plan in plans.items():
+        if not isinstance(plan, dict): continue
+        result.append({"id": key, **plan, "currency": currency, "price": plan.get("price_egp" if currency == "EGP" else "price_usd", 0), "active": bool(plan.get("active", True))})
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
+    return {"ok": True, "currency": currency, "plans": result, "subscription": {**vip, "active": bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))}}
+
+
+@app.get("/api/platform/admin/vip-plans")
+def platform_admin_get_vip_plans(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    plans = platform_state.setdefault("settings", {}).setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+    return {"ok": True, "plans": plans}
+
+
+@app.patch("/api/platform/admin/vip-plans")
+def platform_admin_update_vip_plans(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    plans = payload.get("plans")
+    if not isinstance(plans, dict) or not plans:
+        raise HTTPException(status_code=400, detail="بيانات الباقات غير صالحة.")
+    clean = {}
+    for key in ("vip1", "vip2", "vip3"):
+        plan = plans.get(key)
+        if not isinstance(plan, dict): continue
+        try: days = int(plan.get("days", 0)); egp = float(plan.get("price_egp", 0)); usd = float(plan.get("price_usd", 0))
+        except (TypeError, ValueError): raise HTTPException(status_code=400, detail="السعر أو المدة غير صالحين.")
+        if not 1 <= days <= 36500 or not 0 <= egp <= 100000000 or not 0 <= usd <= 1000000:
+            raise HTTPException(status_code=400, detail="تحقق من مدة الباقة والأسعار.")
+        features = plan.get("features", [])
+        if isinstance(features, str): features = [x.strip() for x in features.splitlines() if x.strip()]
+        if not isinstance(features, list): raise HTTPException(status_code=400, detail="المميزات يجب أن تكون قائمة.")
+        clean[key] = {"name": str(plan.get("name", key.upper()))[:60], "days": days, "price_egp": egp, "price_usd": usd, "active": bool(plan.get("active", True)), "features": [str(x)[:160] for x in features[:20]]}
+    if set(clean) != {"vip1", "vip2", "vip3"}: raise HTTPException(status_code=400, detail="يجب إرسال باقات VIP 1 وVIP 2 وVIP 3.")
     with _platform_lock:
-        platform_state.setdefault("audit", []).append({"id": secrets.token_hex(8), "action": "VIP_PAYMENT_REQUEST", "actor_id": user["id"], "target": user["id"], "detail": f"طلب VIP {days} يوم - مراجعة يدوية", "at": _platform_now()})
-        platform_state.setdefault("vip_requests", []).append({"id": secrets.token_hex(8), "user_id": user["id"], "username": user["username"], "days": days, "status": "pending", "created_at": _platform_now(), "method": str(payload.get("method", "agent"))[:40]})
+        platform_state.setdefault("settings", {})["vip_plans"] = clean
+        _platform_audit(actor, "VIP_PLANS_UPDATED", "all", "VIP plan prices/durations/features updated")
+        _platform_save_state()
+    return {"ok": True, "plans": clean}
+
+
+@app.post("/api/platform/vip/request")
+def platform_vip_request(payload: Dict[str, Any], request: Request, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    try: days = int(payload.get("days", 30))
+    except (TypeError, ValueError): raise HTTPException(status_code=400, detail="مدة الاشتراك غير صالحة.")
+    if not 1 <= days <= 36500: raise HTTPException(status_code=400, detail="مدة الاشتراك يجب أن تكون بين يوم و36500 يوم.")
+    plan_id = str(payload.get("plan_id", "")).lower()
+    plans = platform_state.setdefault("settings", {}).setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+    plan = plans.get(plan_id) if plan_id else None
+    if plan_id and (not isinstance(plan, dict) or not plan.get("active", True) or int(plan.get("days", 0)) != days):
+        raise HTTPException(status_code=400, detail="الباقة غير متاحة أو تغيرت. حدّث صفحة VIP وحاول مجددًا.")
+    price = float(plan.get("price_egp", 0) if str(payload.get("currency", "USD")).upper() == "EGP" else plan.get("price_usd", 0)) if plan else 0
+    country = (request.headers.get("cf-ipcountry") or "").upper()
+    if not country:
+        country = "EG" if str((user.get("profile") or {}).get("country", "")).strip().lower() in {"egypt", "مصر", "eg", "egy"} else "US"
+    currency = "EGP" if country == "EG" else "USD"
+    price = float(plan.get("price_egp", 0) if currency == "EGP" else plan.get("price_usd", 0)) if plan else 0
+    with _platform_lock:
+        platform_state.setdefault("audit", []).append({"id": secrets.token_hex(8), "action": "VIP_PAYMENT_REQUEST", "actor_id": user["id"], "target": user["id"], "detail": f"طلب {plan_id or 'VIP'} {days} يوم — {price:g} {currency} — مراجعة يدوية", "at": _platform_now()})
+        platform_state.setdefault("vip_requests", []).append({"id": secrets.token_hex(8), "user_id": user["id"], "username": user["username"], "plan_id": plan_id, "days": days, "price": price, "currency": currency, "status": "pending", "created_at": _platform_now(), "method": str(payload.get("method", "agent"))[:40]})
         _platform_save_state()
     return {"ok": True, "message": "تم تسجيل طلب الاشتراك للمراجعة اليدوية. لم يتم تفعيل VIP أو تأكيد الدفع تلقائيًا."}
 
