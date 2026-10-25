@@ -2283,6 +2283,10 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
             public_id = str(secrets.randbelow(900000000) + 100000000)
         user["display_id"] = public_id
     user.setdefault("badges", [])
+    # OWNER accounts are always marked verified; verification is otherwise controlled by the owner via admin API.
+    if str(user.get("role", "USER")).upper() == "OWNER":
+        user["verified"] = True
+    user["verified"] = bool(user.get("verified", False))
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
     active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
     days_left = 0
@@ -2294,7 +2298,7 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
             days_left = 0
     return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "username": user.get("username"), "role": user.get("role", "USER"),
             "profile": normalized_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip, "days_left": days_left},
-            "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned"))}
+            "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned")), "verified": bool(user.get("verified"))}
 
 
 def _platform_password_hash(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
@@ -2348,7 +2352,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v151", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v158", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2692,7 +2696,7 @@ def platform_owner_sound_file():
 
 @app.get("/api/platform/health")
 def platform_health():
-    return {"ok": True, "service": "PHANTOM ELITE", "release": "v151", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v158", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
 
 
 @app.get("/api/platform/apps")
@@ -2796,11 +2800,15 @@ def platform_send_message(payload: Dict[str, Any], authorization: Optional[str] 
 
 
 @app.get("/api/platform/support/messages")
-def platform_support_messages(authorization: Optional[str] = Header(default=None)):
+def platform_support_messages(recipient: str = "support", authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
+    recipient = str(recipient or "support").strip().lower()
+    if recipient not in {"support", "owner"}:
+        raise HTTPException(status_code=400, detail="قناة المحادثة غير صالحة.")
     with _platform_lock:
-        rows = [m for m in platform_state.get("support_messages", []) if m.get("user_id") == user.get("id")]
-        return {"ok": True, "messages": rows[-500:], "support_name": "خدمة العملاء"}
+        rows = [m for m in platform_state.get("support_messages", [])
+                if m.get("user_id") == user.get("id") and str(m.get("recipient", "support")).lower() == recipient]
+        return {"ok": True, "messages": rows[-500:], "support_name": "المالك • Super Admin" if recipient == "owner" else "خدمة العملاء", "recipient": recipient}
 
 
 @app.post("/api/platform/support/messages")
@@ -2809,11 +2817,14 @@ def platform_support_send(payload: Dict[str, Any], authorization: Optional[str] 
     if not platform_state.get("settings", {}).get("chat_enabled", True):
         raise HTTPException(status_code=403, detail="خدمة الرسائل متوقفة حاليًا.")
     content = str(payload.get("content", "")).strip()
+    recipient = str(payload.get("recipient", "support") or "support").strip().lower()
+    if recipient not in {"support", "owner"}:
+        raise HTTPException(status_code=400, detail="قناة المحادثة غير صالحة.")
     if not content or len(content) > 3000:
         raise HTTPException(status_code=400, detail="اكتب رسالة لا تتجاوز 3000 حرف.")
     with _platform_lock:
         row = {"id": secrets.token_hex(8), "user_id": user.get("id"), "username": user.get("username"),
-               "sender_role": "user", "content": content, "created_at": _platform_now(), "read": False}
+               "recipient": recipient, "sender_role": "user", "content": content, "created_at": _platform_now(), "read": False}
         platform_state.setdefault("support_messages", []).append(row)
         platform_state["support_messages"] = platform_state["support_messages"][-10000:]
         _platform_save_state()
@@ -2828,11 +2839,13 @@ def platform_admin_support_messages(authorization: Optional[str] = Header(defaul
         users = {u.get("id"): _platform_user_public(u) for u in platform_state.get("users", {}).values()}
         grouped = {}
         for row in rows:
-            grouped.setdefault(row.get("user_id"), []).append(row)
+            channel = str(row.get("recipient", "support")).lower()
+            grouped.setdefault((row.get("user_id"), channel), []).append(row)
         conversations = []
-        for uid, msgs in grouped.items():
+        for (uid, channel), msgs in grouped.items():
             user = users.get(uid, {})
-            conversations.append({"user_id": uid, "username": user.get("username", msgs[0].get("username", "مستخدم")),
+            conversations.append({"user_id": uid, "recipient": channel, "recipient_name": "المالك • Super Admin" if channel == "owner" else "خدمة العملاء",
+                                 "username": user.get("username", msgs[0].get("username", "مستخدم")),
                                  "display_name": (user.get("profile") or {}).get("display_name", ""),
                                  "messages": msgs[-500:], "last_at": msgs[-1].get("created_at", "")})
         conversations.sort(key=lambda c: c.get("last_at", ""), reverse=True)
@@ -2843,20 +2856,26 @@ def platform_admin_support_messages(authorization: Optional[str] = Header(defaul
 def platform_admin_support_reply(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     actor = _platform_require_admin(authorization, allow_moderator=True)
     user_id = str(payload.get("user_id", "")).strip()
+    recipient = str(payload.get("recipient", "support") or "support").strip().lower()
     content = str(payload.get("content", "")).strip()
+    if recipient not in {"support", "owner"}:
+        raise HTTPException(status_code=400, detail="قناة المحادثة غير صالحة.")
+    if recipient == "owner" and actor.get("role") != "OWNER":
+        raise HTTPException(status_code=403, detail="الرد على قناة المالك متاح لحساب المالك فقط.")
     if not user_id or not content or len(content) > 3000:
         raise HTTPException(status_code=400, detail="المستخدم والرسالة مطلوبان، بحد أقصى 3000 حرف.")
     with _platform_lock:
         target = next((u for u in platform_state.get("users", {}).values() if u.get("id") == user_id), None)
         if not target:
             raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
-        row = {"id": secrets.token_hex(8), "user_id": user_id, "username": target.get("username"),
-               "sender_role": "support", "sender_name": "خدمة العملاء", "admin_username": actor.get("username"),
+        sender_name = "المالك • Super Admin" if recipient == "owner" else "خدمة العملاء"
+        row = {"id": secrets.token_hex(8), "user_id": user_id, "username": target.get("username"), "recipient": recipient,
+               "sender_role": "support", "sender_name": sender_name, "admin_username": actor.get("username"),
                "content": content, "created_at": _platform_now(), "read": True}
         platform_state.setdefault("support_messages", []).append(row)
         platform_state["support_messages"] = platform_state["support_messages"][-10000:]
         _platform_save_state()
-        _platform_audit(actor, "SUPPORT_REPLY", user_id, content[:160])
+        _platform_audit(actor, "OWNER_CHAT_REPLY" if recipient == "owner" else "SUPPORT_REPLY", user_id, content[:160])
         return {"ok": True, "message": row}
 
 
@@ -3150,12 +3169,17 @@ def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorizat
             changes["display_id"] = custom_id
         if "featured" in payload:
             changes["featured"] = bool(payload["featured"])
+        if "verified" in payload:
+            if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="توثيق الحسابات متاح للمالك فقط.")
+            if is_owner_target and not bool(payload["verified"]): raise HTTPException(status_code=403, detail="حساب المالك موثّق دائمًا.")
+            changes["verified"] = bool(payload["verified"])
         if "badges" in payload and actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="إدارة الشارات للمالك فقط.")
         # ---- apply ----
         audit_payload = {k: v for k, v in payload.items() if k not in {"password"}}
         if "password" in changes: audit_payload["password"] = "(reset)"
         if "banned" in changes: target["banned"] = changes["banned"]
         if "role" in changes: target["role"] = changes["role"]
+        if "verified" in changes: target["verified"] = changes["verified"]
         if "featured" in changes:
             featured = platform_state.setdefault("featured_user_ids", [])
             if changes["featured"] and user_id not in featured: featured.append(user_id)
