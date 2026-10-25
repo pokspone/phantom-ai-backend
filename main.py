@@ -17,6 +17,7 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Header
@@ -2267,6 +2268,182 @@ def _platform_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+try:
+    PLATFORM_CAIRO_TZ = ZoneInfo("Africa/Cairo")
+except Exception:  # pragma: no cover - ZoneInfo is present on supported Python builds
+    PLATFORM_CAIRO_TZ = timezone.utc
+
+
+def _platform_vip_defaults() -> Dict[str, Dict[str, Any]]:
+    # Keep plan descriptions aligned with server-enforced entitlements: static images from VIP 1,
+    # custom profile audio from VIP 2, and animated GIF only from VIP 3.
+    vip1 = [
+        "شارة VIP 1", "دعم سريع", "12 توقع VIP يوميًا",
+        "إرسال الصور الثابتة إلى خدمة العملاء", "عرض مدة الاشتراك وسجل التوقعات المتاحة",
+    ]
+    vip2 = [
+        "شارة VIP 2", "كل مزايا VIP 1", "25 توقع VIP يوميًا",
+        "صوت مميز للبروفايل", "تحليل إحصائي موسع للبيانات المتاحة", "أولوية دعم أعلى",
+    ]
+    vip3 = [
+        "شارة VIP 3", "كل مزايا VIP 1 وVIP 2", "55 توقع VIP يوميًا",
+        "صور متحركة GIF في البروفايل والمحادثات حتى 5 ميجابايت",
+        "تحليل أنماط متقدم بالاعتماد على البيانات المتاحة", "أولوية دعم قصوى",
+    ]
+    return {
+        "vip1": {"daily_predictions": 12, "features": vip1},
+        "vip2": {"daily_predictions": 25, "features": vip2},
+        "vip3": {"daily_predictions": 55, "features": vip3},
+    }
+
+
+def _platform_migrate_v161_state() -> None:
+    """Add V161 entitlement settings without resetting existing prices, dates, or accounts."""
+    settings = platform_state.setdefault("settings", {})
+    plans = settings.setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+    defaults = _platform_vip_defaults()
+    for key in ("vip1", "vip2", "vip3"):
+        old = plans.get(key) if isinstance(plans, dict) else None
+        if not isinstance(old, dict):
+            old = {}
+        seed = defaults[key]
+        try:
+            daily = int(old.get("daily_predictions", seed["daily_predictions"]))
+        except (TypeError, ValueError):
+            daily = seed["daily_predictions"]
+        daily = max(1, min(1000, daily))
+        old_features = old.get("features", [])
+        if isinstance(old_features, str):
+            old_features = [x.strip() for x in old_features.splitlines() if x.strip()]
+        if not isinstance(old_features, list):
+            old_features = []
+        # Remove stale quota text so the feature list always matches the actual configurable limit.
+        clean_old = [str(x).strip()[:160] for x in old_features if str(x).strip() and not re.search(r"\d+\s*(?:توقع|توقعات).*?(?:يومي|يوميا|يوميًا)", str(x), re.I)]
+        # Remove stale feature claims that would contradict enforced media entitlements.
+        if key != "vip3":
+            clean_old = [x for x in clean_old if not re.search(r"\bgif\b|صور?\s+متحرك|متحركة", x, re.I)]
+        if key == "vip1":
+            clean_old = [x for x in clean_old if not re.search(r"صوت.{0,30}بروفايل|موسيقى.{0,30}بروفايل", x, re.I)]
+        features = []
+        for item in list(seed["features"]) + clean_old:
+            item = str(item).strip()[:160]
+            if item and item not in features:
+                features.append(item)
+        quota_text = f"{daily} توقع VIP يوميًا"
+        features = [x for x in features if not re.search(r"\d+\s*(?:توقع|توقعات).*?(?:يومي|يوميا|يوميًا)", x, re.I)]
+        features.insert(min(2, len(features)), quota_text)
+        old.update({"name": str(old.get("name") or key.upper())[:60], "days": int(old.get("days", {"vip1":30,"vip2":150,"vip3":365}[key]) or {"vip1":30,"vip2":150,"vip3":365}[key]),
+                    "price_egp": old.get("price_egp", 0), "price_usd": old.get("price_usd", 0),
+                    "active": bool(old.get("active", True)), "daily_predictions": daily, "features": features[:20]})
+        plans[key] = old
+    platform_state.setdefault("vip_prediction_usage", {})
+    platform_state.setdefault("vip_prediction_logs", [])
+
+
+def _platform_vip_active(user: Dict[str, Any]) -> bool:
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
+    if not vip.get("active"):
+        return False
+    expires = vip.get("expires_at")
+    if not expires:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _platform_vip_tier(user: Dict[str, Any]) -> int:
+    role = str(user.get("role", "USER")).upper()
+    if role in {"OWNER", "ADMIN"}:
+        return 3
+    if not _platform_vip_active(user):
+        return 0
+    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
+    plan_id = str(vip.get("plan_id") or "").strip().lower()
+    if plan_id in {"vip1", "vip2", "vip3"}:
+        return int(plan_id[-1])
+    plan_name = str(vip.get("plan_name") or "").lower()
+    match = re.search(r"vip\s*([123])", plan_name)
+    if match:
+        return int(match.group(1))
+    try:
+        days = int(vip.get("plan_days", 0) or 0)
+    except (TypeError, ValueError):
+        days = 0
+    return 3 if days >= 365 else 2 if days >= 150 else 1 if days > 0 else 0
+
+
+def _platform_prediction_limit(user: Dict[str, Any]) -> Optional[int]:
+    if str(user.get("role", "USER")).upper() in {"OWNER", "ADMIN"}:
+        return None  # owner/admin test and moderation accounts are not paid subscriptions
+    tier = _platform_vip_tier(user)
+    if tier < 1:
+        return 0
+    key = f"vip{tier}"
+    plans = platform_state.get("settings", {}).get("vip_plans", {})
+    plan = plans.get(key, {}) if isinstance(plans, dict) else {}
+    try:
+        return max(1, min(1000, int(plan.get("daily_predictions", {1:12,2:25,3:55}[tier]))))
+    except (TypeError, ValueError):
+        return {1: 12, 2: 25, 3: 55}[tier]
+
+
+def _platform_cairo_date() -> str:
+    return datetime.now(PLATFORM_CAIRO_TZ).date().isoformat()
+
+
+def _platform_prediction_usage(user: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = str(user.get("id", ""))
+    today = _platform_cairo_date()
+    with _platform_lock:
+        by_user = platform_state.setdefault("vip_prediction_usage", {}).setdefault(user_id, {})
+        used = int(by_user.get(today, 0) or 0)
+    limit = _platform_prediction_limit(user)
+    remaining = None if limit is None else max(0, limit - used)
+    reset = datetime.combine(datetime.now(PLATFORM_CAIRO_TZ).date() + __import__("datetime").timedelta(days=1), datetime.min.time(), tzinfo=PLATFORM_CAIRO_TZ).isoformat()
+    return {"date": today, "timezone": "Africa/Cairo", "tier": _platform_vip_tier(user), "tier_name": "المالك / الإدارة" if limit is None else (f"VIP {_platform_vip_tier(user)}" if _platform_vip_tier(user) else "مجاني"),
+            "limit": limit, "used": used, "remaining": remaining, "unlimited": limit is None, "resets_at": reset}
+
+
+def _platform_reserve_vip_prediction(user: Dict[str, Any]) -> Dict[str, Any]:
+    if str(user.get("role", "USER")).upper() not in {"OWNER", "ADMIN"} and _platform_vip_tier(user) < 1:
+        raise HTTPException(status_code=403, detail="تحليل توقعات VIP متاح للمشتركين فقط. اختر باقة VIP لتفعيل الميزة.")
+    user_id = str(user.get("id", ""))
+    today = _platform_cairo_date()
+    limit = _platform_prediction_limit(user)
+    with _platform_lock:
+        by_user = platform_state.setdefault("vip_prediction_usage", {}).setdefault(user_id, {})
+        used = int(by_user.get(today, 0) or 0)
+        if limit is not None and used >= limit:
+            raise HTTPException(status_code=429, detail="تم نفاد توقعات VIP المتاحة لك اليوم. تتجدد توقعاتك يوميًا بتوقيت القاهرة.")
+        by_user[today] = used + 1
+        # Retain a bounded history for resetting and support diagnostics.
+        for old_day in sorted(by_user)[:-31]:
+            by_user.pop(old_day, None)
+        _platform_save_state()
+    return _platform_prediction_usage(user)
+
+
+def _platform_rollback_vip_prediction(user: Dict[str, Any], usage_date: str) -> None:
+    user_id = str(user.get("id", ""))
+    with _platform_lock:
+        by_user = platform_state.setdefault("vip_prediction_usage", {}).setdefault(user_id, {})
+        if usage_date == _platform_cairo_date() and int(by_user.get(usage_date, 0) or 0) > 0:
+            by_user[usage_date] = int(by_user.get(usage_date, 0)) - 1
+            try:
+                _platform_save_state()
+            except Exception:
+                logger.exception("Could not roll back failed VIP prediction reservation")
+
+
+_platform_migrate_v161_state()
+_platform_last_saved_state = copy.deepcopy(platform_state)
+
+
 def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     # Backfill profile fields for accounts created by older builds so the profile UI never receives null/missing fields.
     username = str(user.get("username") or "عضو جديد")
@@ -2274,6 +2451,7 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     profile_defaults = {"display_name": username, "avatar": "", "banner": "", "bio": "", "city": "", "governorate": "", "relationship": "", "age": "", "gender": "", "country": "", "job": "", "interests": "", "social": "", "sound": "", "sound_enabled": True}
     normalized_profile = {**profile_defaults, **profile}
     user["profile"] = normalized_profile
+    public_profile = copy.deepcopy(normalized_profile)
     # One stable public ID is shared across profile, user cards, and admin panel.
     public_id = str(user.get("display_id", "")).strip()
     if not re.fullmatch(r"\d{1,12}", public_id):
@@ -2288,7 +2466,7 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
         user["verified"] = True
     user["verified"] = bool(user.get("verified", False))
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
-    active_vip = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+    active_vip = _platform_vip_active(user)
     days_left = 0
     if active_vip and vip.get("expires_at"):
         try:
@@ -2296,8 +2474,19 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
             days_left = max(0, math.ceil(remaining / 86400))
         except Exception:
             days_left = 0
+    tier = _platform_vip_tier(user)
+    # Stored animated files remain intact, but the public profile hides GIF media after the entitlement ends.
+    if not _platform_can_animate(user):
+        for media_field in ("avatar", "banner"):
+            media_url = str(normalized_profile.get(media_field, "") or "").lower().split("?", 1)[0]
+            if media_url.endswith(".gif") or media_url.startswith("data:image/gif;"):
+                public_profile[media_field] = ""
+    # Custom profile sound is a VIP 2+ benefit; hide it in the public result without deleting stored profile data.
+    if not _platform_can_profile_sound(user):
+        public_profile["sound"] = ""
+    daily_limit = _platform_prediction_limit(user)
     return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "username": user.get("username"), "role": user.get("role", "USER"),
-            "profile": normalized_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip, "days_left": days_left},
+            "profile": public_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip, "days_left": days_left, "tier": tier, "daily_predictions": daily_limit},
             "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned")), "verified": bool(user.get("verified"))}
 
 
@@ -2444,11 +2633,59 @@ def platform_me(authorization: Optional[str] = Header(default=None)):
     return {"ok": True, "user": _platform_user_public(user), "settings": platform_state.get("settings", {})}
 
 
-def _platform_can_animate(user: Dict[str, Any]) -> bool:
-    if user.get("role") in {"OWNER", "ADMIN"}: return True
+def _platform_can_chat_images(user: Dict[str, Any]) -> bool:
+    """Static chat-image uploads are a VIP 1+ feature; never trust client UI flags."""
+    if str(user.get("role", "")).upper() in {"OWNER", "ADMIN"}:
+        return True
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
-    active = bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
-    return active and (str(vip.get("plan_id", "")).lower() in {"vip2", "vip3"} or int(vip.get("plan_days", 0) or 0) >= 150)
+    if not vip.get("active"):
+        return False
+    expires_at = vip.get("expires_at")
+    if expires_at and str(expires_at) <= _platform_now():
+        return False
+    plan_id = str(vip.get("plan_id", "")).strip().lower()
+    if plan_id in {"vip1", "vip2", "vip3"}:
+        return True
+    # Backward-compatible records created before plan_id was stored.
+    try:
+        return int(vip.get("plan_days", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _platform_validate_chat_image(user: Dict[str, Any], image_url: str) -> None:
+    """Accept only images uploaded to the user's own phantom-media prefix or bounded data URLs."""
+    if not image_url or len(image_url) > 7_200_000:
+        raise HTTPException(status_code=413, detail="الصورة كبيرة جدًا لإرسالها في المحادثة.")
+    match = re.fullmatch(r"data:image/(jpeg|png|webp|gif);base64,([A-Za-z0-9+/=]+)", image_url)
+    if match:
+        mime_subtype, encoded = match.groups()
+        if mime_subtype == "gif" and not _platform_can_animate(user):
+            raise HTTPException(status_code=403, detail="الصور المتحركة GIF متاحة لمشتركي VIP 3 فقط.")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
+        max_bytes = 5 * 1024 * 1024 if mime_subtype == "gif" else 950 * 1024
+        if not raw or len(raw) > max_bytes:
+            raise HTTPException(status_code=413, detail="حجم الصورة أكبر من الحد المسموح.")
+        return
+    # Hosted uploads must belong to the sending user's own folder; arbitrary external links are rejected.
+    prefix = SUPABASE_URL.rstrip("/") + "/storage/v1/object/public/phantom-media/users/" + str(user.get("id")) + "/"
+    if not SUPABASE_URL or not image_url.startswith(prefix) or any(ch in image_url for ch in "\r\n\t "):
+        raise HTTPException(status_code=400, detail="رابط الصورة غير صالح. ارفع الصورة من زر الصور داخل الشات.")
+    suffix = image_url.rsplit("/", 1)[-1].lower().split("?", 1)[0]
+    if not suffix.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        raise HTTPException(status_code=400, detail="نوع صورة المحادثة غير مدعوم.")
+    if suffix.endswith(".gif") and not _platform_can_animate(user):
+        raise HTTPException(status_code=403, detail="الصور المتحركة GIF متاحة لمشتركي VIP 3 فقط.")
+
+
+def _platform_can_animate(user: Dict[str, Any]) -> bool:
+    """Animated profile/chat images are a VIP 3 feature; owner/admin retain moderation access."""
+    if str(user.get("role", "")).upper() in {"OWNER", "ADMIN"}:
+        return True
+    return _platform_vip_tier(user) >= 3
 
 
 PLATFORM_AUDIO_MAX_BYTES = 1536 * 1024
@@ -2520,15 +2757,16 @@ def _platform_probe_sound_url(url: str) -> Dict[str, Any]:
 
 
 def _platform_can_profile_sound(user: Dict[str, Any]) -> bool:
-    if user.get("role") in {"OWNER", "ADMIN"}: return True
-    vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
-    return bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))
+    """Custom profile music is available to VIP 2+; owner/admin can configure accounts."""
+    if str(user.get("role", "")).upper() in {"OWNER", "ADMIN"}:
+        return True
+    return _platform_vip_tier(user) >= 2
 
 
 def _platform_upload_audio(user: Dict[str, Any], mime: str, encoded: str, admin_override: bool = False) -> Dict[str, Any]:
     """Profile sound upload. Uses the same Supabase Storage bucket (phantom-media) as images."""
     if not admin_override and not _platform_can_profile_sound(user):
-        raise HTTPException(status_code=403, detail="صوت البروفايل متاح للمالك والإدارة ومشتركي VIP.")
+        raise HTTPException(status_code=403, detail="صوت البروفايل المخصص متاح لمشتركي VIP 2 وVIP 3 والمالك والإدارة.")
     try: raw = base64.b64decode(encoded, validate=True)
     except Exception: raise HTTPException(status_code=400, detail="بيانات ملف الصوت غير صالحة.")
     if not raw or len(raw) > PLATFORM_AUDIO_MAX_BYTES: raise HTTPException(status_code=413, detail="ملف الصوت يجب ألا يتجاوز 1.5 ميجابايت.")
@@ -2558,7 +2796,7 @@ def platform_media_upload(payload: Dict[str, Any], authorization: Optional[str] 
     match = re.fullmatch(r"data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)", data_url)
     if not match: raise HTTPException(status_code=400, detail="صيغة الملف غير مدعومة. الصور: JPG أو PNG أو WEBP أو GIF — الصوت: MP3 أو OGG أو WAV أو M4A.")
     mime, encoded = match.groups()
-    if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP 2 وVIP 3 فقط.")
+    if mime == "image/gif" and not _platform_can_animate(user): raise HTTPException(status_code=403, detail="الصور المتحركة GIF متاحة لمشتركي VIP 3 فقط.")
     try: raw = base64.b64decode(encoded, validate=True)
     except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
     max_bytes = 5 * 1024 * 1024 if mime == "image/gif" else 950 * 1024
@@ -2608,7 +2846,7 @@ def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str
         sound = str(payload.get("sound") or "").strip()
         if sound and sound != str(profile.get("sound") or ""):
             if not _platform_can_profile_sound(user):
-                raise HTTPException(status_code=403, detail="صوت البروفايل متاح للمالك والإدارة ومشتركي VIP.")
+                raise HTTPException(status_code=403, detail="صوت البروفايل المخصص متاح لمشتركي VIP 2 وVIP 3 والمالك والإدارة.")
             sound = _platform_validate_sound_value(sound)
         profile["sound"] = sound
     if "sound_enabled" in payload:
@@ -2623,7 +2861,7 @@ def platform_update_profile(payload: Dict[str, Any], authorization: Optional[str
                     raise HTTPException(status_code=400, detail="صيغة الصورة غير مدعومة. استخدم JPG أو PNG أو WEBP أو GIF.")
                 data_mime, data_encoded = data_match.groups()
                 if data_mime == "image/gif" and not _platform_can_animate(user):
-                    raise HTTPException(status_code=403, detail="الصور المتحركة متاحة لمشتركي VIP 2 وVIP 3 فقط.")
+                    raise HTTPException(status_code=403, detail="الصور المتحركة GIF متاحة لمشتركي VIP 3 فقط.")
                 try: data_raw = base64.b64decode(data_encoded, validate=True)
                 except Exception: raise HTTPException(status_code=400, detail="بيانات الصورة غير صالحة.")
                 data_limit = 5 * 1024 * 1024 if data_mime == "image/gif" else 950 * 1024
@@ -2817,14 +3055,23 @@ def platform_support_send(payload: Dict[str, Any], authorization: Optional[str] 
     if not platform_state.get("settings", {}).get("chat_enabled", True):
         raise HTTPException(status_code=403, detail="خدمة الرسائل متوقفة حاليًا.")
     content = str(payload.get("content", "")).strip()
+    image_url = str(payload.get("image_url", "")).strip()
     recipient = str(payload.get("recipient", "support") or "support").strip().lower()
     if recipient not in {"support", "owner"}:
         raise HTTPException(status_code=400, detail="قناة المحادثة غير صالحة.")
-    if not content or len(content) > 3000:
-        raise HTTPException(status_code=400, detail="اكتب رسالة لا تتجاوز 3000 حرف.")
+    if len(content) > 3000:
+        raise HTTPException(status_code=400, detail="الرسالة أطول من 3000 حرف.")
+    if not content and not image_url:
+        raise HTTPException(status_code=400, detail="اكتب رسالة أو اختر صورة لإرسالها.")
+    if image_url:
+        if not _platform_can_chat_images(user):
+            raise HTTPException(status_code=403, detail="إرسال الصور في الشات متاح لمشتركي VIP 1 فأعلى.")
+        _platform_validate_chat_image(user, image_url)
     with _platform_lock:
         row = {"id": secrets.token_hex(8), "user_id": user.get("id"), "username": user.get("username"),
                "recipient": recipient, "sender_role": "user", "content": content, "created_at": _platform_now(), "read": False}
+        if image_url:
+            row["image_url"] = image_url
         platform_state.setdefault("support_messages", []).append(row)
         platform_state["support_messages"] = platform_state["support_messages"][-10000:]
         _platform_save_state()
@@ -2844,11 +3091,14 @@ def platform_admin_support_messages(authorization: Optional[str] = Header(defaul
         conversations = []
         for (uid, channel), msgs in grouped.items():
             user = users.get(uid, {})
+            raw_user = next((u for u in platform_state.get("users", {}).values() if u.get("id") == uid), {})
+            vip_tier = _platform_vip_tier(raw_user) if raw_user else 0
             conversations.append({"user_id": uid, "recipient": channel, "recipient_name": "المالك • Super Admin" if channel == "owner" else "خدمة العملاء",
                                  "username": user.get("username", msgs[0].get("username", "مستخدم")),
                                  "display_name": (user.get("profile") or {}).get("display_name", ""),
+                                 "vip_tier": vip_tier, "priority": "قصوى" if vip_tier >= 3 else "عالية" if vip_tier == 2 else "سريعة" if vip_tier == 1 else "عادية",
                                  "messages": msgs[-500:], "last_at": msgs[-1].get("created_at", "")})
-        conversations.sort(key=lambda c: c.get("last_at", ""), reverse=True)
+        conversations.sort(key=lambda c: (int(c.get("vip_tier", 0)), c.get("last_at", "")), reverse=True)
         return {"ok": True, "conversations": conversations}
 
 
@@ -3004,7 +3254,9 @@ def platform_vip_plans(request: Request, authorization: Optional[str] = Header(d
         if not isinstance(plan, dict): continue
         result.append({"id": key, **plan, "currency": currency, "price": plan.get("price_egp" if currency == "EGP" else "price_usd", 0), "active": bool(plan.get("active", True))})
     vip = user.get("vip") if isinstance(user.get("vip"), dict) else {}
-    return {"ok": True, "currency": currency, "plans": result, "subscription": {**vip, "active": bool(vip.get("active") and (not vip.get("expires_at") or str(vip.get("expires_at")) > _platform_now()))}}
+    active = _platform_vip_active(user)
+    result = [{**p, "daily_predictions": int(p.get("daily_predictions", {"vip1":12,"vip2":25,"vip3":55}.get(str(p.get("id", "")), 12)))} for p in result]
+    return {"ok": True, "currency": currency, "plans": result, "subscription": {**vip, "active": active, "tier": _platform_vip_tier(user) if active else 0, "daily_predictions": _platform_prediction_limit(user), "days_left": _platform_user_public(user).get("vip", {}).get("days_left", 0)}}
 
 
 @app.get("/api/platform/admin/vip-plans")
@@ -3017,6 +3269,8 @@ def platform_admin_get_vip_plans(authorization: Optional[str] = Header(default=N
 @app.patch("/api/platform/admin/vip-plans")
 def platform_admin_update_vip_plans(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     actor = _platform_require_admin(authorization)
+    if str(actor.get("role", "")).upper() != "OWNER":
+        raise HTTPException(status_code=403, detail="تعديل أسعار الباقات وحدود التوقعات اليومية متاح للمالك فقط.")
     plans = payload.get("plans")
     if not isinstance(plans, dict) or not plans:
         raise HTTPException(status_code=400, detail="بيانات الباقات غير صالحة.")
@@ -3024,14 +3278,24 @@ def platform_admin_update_vip_plans(payload: Dict[str, Any], authorization: Opti
     for key in ("vip1", "vip2", "vip3"):
         plan = plans.get(key)
         if not isinstance(plan, dict): continue
-        try: days = int(plan.get("days", 0)); egp = float(plan.get("price_egp", 0)); usd = float(plan.get("price_usd", 0))
-        except (TypeError, ValueError): raise HTTPException(status_code=400, detail="السعر أو المدة غير صالحين.")
-        if not 1 <= days <= 36500 or not 0 <= egp <= 100000000 or not 0 <= usd <= 1000000:
-            raise HTTPException(status_code=400, detail="تحقق من مدة الباقة والأسعار.")
+        try:
+            days = int(plan.get("days", 0)); egp = float(plan.get("price_egp", 0)); usd = float(plan.get("price_usd", 0))
+            daily_predictions = int(plan.get("daily_predictions", _platform_vip_defaults()[key]["daily_predictions"]))
+        except (TypeError, ValueError): raise HTTPException(status_code=400, detail="السعر أو المدة أو حد التوقعات غير صالح.")
+        if not 1 <= days <= 36500 or not 0 <= egp <= 100000000 or not 0 <= usd <= 1000000 or not 1 <= daily_predictions <= 1000:
+            raise HTTPException(status_code=400, detail="تحقق من مدة الباقة والأسعار وحد التوقعات اليومي (1–1000).")
         features = plan.get("features", [])
         if isinstance(features, str): features = [x.strip() for x in features.splitlines() if x.strip()]
         if not isinstance(features, list): raise HTTPException(status_code=400, detail="المميزات يجب أن تكون قائمة.")
-        clean[key] = {"name": str(plan.get("name", key.upper()))[:60], "days": days, "price_egp": egp, "price_usd": usd, "active": bool(plan.get("active", True)), "features": [str(x)[:160] for x in features[:20]]}
+        clean_features = [str(x)[:160].strip() for x in features[:20]]
+        clean_features = [x for x in clean_features if x and not re.search(r"\d+\s*(?:توقع|توقعات).*?(?:يومي|يوميا|يوميًا)", x, re.I)]
+        # Do not let editable marketing text claim media that the server will reject.
+        if key != "vip3":
+            clean_features = [x for x in clean_features if not re.search(r"\bgif\b|صور?\s+متحرك|متحركة", x, re.I)]
+        if key == "vip1":
+            clean_features = [x for x in clean_features if not re.search(r"صوت.{0,30}بروفايل|موسيقى.{0,30}بروفايل", x, re.I)]
+        clean_features.insert(min(2, len(clean_features)), f"{daily_predictions} توقع VIP يوميًا")
+        clean[key] = {"name": str(plan.get("name", key.upper()))[:60], "days": days, "price_egp": egp, "price_usd": usd, "active": bool(plan.get("active", True)), "daily_predictions": daily_predictions, "features": clean_features[:20]}
     if set(clean) != {"vip1", "vip2", "vip3"}: raise HTTPException(status_code=400, detail="يجب إرسال باقات VIP 1 وVIP 2 وVIP 3.")
     with _platform_lock:
         platform_state.setdefault("settings", {})["vip_plans"] = clean
@@ -3506,17 +3770,40 @@ def platform_announcements(authorization: Optional[str] = Header(default=None)):
     return {"ok": True, "announcements": list(reversed(platform_state.get("announcements", [])[-50:]))}
 
 
+@app.get("/api/platform/predictions/usage")
+def platform_prediction_usage(authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    return {"ok": True, "usage": _platform_prediction_usage(user)}
+
+
 @app.post("/api/platform/predict")
 async def platform_predict(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
     history = payload.get("history", [])
-    if not isinstance(history, list): raise HTTPException(status_code=400, detail="سجل المزرعة يجب أن يكون قائمة.")
-    is_vip = bool(_platform_user_public(user).get("vip", {}).get("active"))
-    max_history = 100 if is_vip else 8
-    clean_history = [str(x) for x in history][-max_history:]
-    result = await predict_endpoint(PredictionRequest(game_type="FARM", history=clean_history, room_id="platform-farm", coins=0), authorization=authorization)
-    record = {"mode": "VIP" if is_vip else "FREE", "history_count": len(clean_history), "source": "history_analysis_not_live_game_feed"}
-    return {"ok": True, "record": record, "analysis": result, "notice": ("تحليل إحصائي للسجل المدخل فقط؛ لا يوجد اتصال مباشر مؤكد بنتائج اللعبة ولا ضمان للنتيجة التالية." if is_vip else "الوضع المجاني يستخدم آخر 8 نتائج فقط. التحليل إحصائي وليس اتصالًا مباشرًا بسيرفر اللعبة ولا ضمانًا للنتيجة التالية.")}
+    if not isinstance(history, list):
+        raise HTTPException(status_code=400, detail="سجل المزرعة يجب أن يكون قائمة.")
+    clean_history = [str(x)[:100] for x in history if str(x).strip()][-100:]
+    if len(clean_history) < 3:
+        raise HTTPException(status_code=400, detail="أدخل 3 نتائج سابقة على الأقل قبل احتساب توقع VIP.")
+    # Reserve atomically before analysis so concurrent requests cannot exceed the daily quota.
+    reservation = _platform_reserve_vip_prediction(user)
+    usage_date = reservation["date"]
+    try:
+        result = await predict_endpoint(PredictionRequest(game_type="FARM", history=clean_history, room_id="platform-farm", coins=0), authorization=authorization)
+        with _platform_lock:
+            logs = platform_state.setdefault("vip_prediction_logs", [])
+            logs.append({"id": secrets.token_hex(8), "user_id": user.get("id"), "username": user.get("username"),
+                         "tier": _platform_vip_tier(user), "date": usage_date, "created_at": _platform_now(),
+                         "history_count": len(clean_history), "source": "history_analysis_not_live_game_feed"})
+            platform_state["vip_prediction_logs"] = logs[-20000:]
+            _platform_save_state()
+        usage = _platform_prediction_usage(user)
+        return {"ok": True, "record": {"mode": "VIP", "tier": usage["tier"], "history_count": len(clean_history),
+                "source": "history_analysis_not_live_game_feed"}, "analysis": result, "usage": usage,
+                "notice": "تحليل إحصائي للسجل المدخل فقط؛ لا يوجد اتصال مباشر مؤكد بنتائج اللعبة ولا ضمان للنتيجة التالية."}
+    except Exception:
+        _platform_rollback_vip_prediction(user, usage_date)
+        raise
 
 
 
