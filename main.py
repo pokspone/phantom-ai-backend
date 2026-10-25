@@ -2197,7 +2197,7 @@ def _platform_default_state() -> Dict[str, Any]:
         "users": {}, "sessions": {}, "moments": [], "messages": [], "support_messages": [], "reports": [], "predictions": [],
         "announcements": [], "featured_user_ids": [], "audit": [], "subscription_codes": [],
         "apps": [
-            {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
+            {"id": "hifami", "name": "Hi Fami", "active": True, "engine": "FARM", "round_seconds": 29, "icon_url": "https://i.ibb.co/tM16LHRK/screen-0.png", "game_image_url": "https://i.ibb.co/DDcmqY3V/1792720152278.jpg"},
         ],
         "settings": {"app_name": "PHANTOM ELITE", "sound_enabled": True, "theme": "royal-dark", "vip_prices": {"30": 150, "150": 500, "365": 1000}, "vip_plans": {"vip1": {"name":"VIP 1", "days":30, "price_egp":150, "price_usd":150, "active":True, "features":["شارة VIP","تحليلات موسعة","أولوية الدعم"]}, "vip2": {"name":"VIP 2", "days":150, "price_egp":500, "price_usd":500, "active":True, "features":["كل مزايا VIP 1","صور متحركة حتى 5 ميجابايت"]}, "vip3": {"name":"VIP 3", "days":365, "price_egp":1000, "price_usd":1000, "active":True, "features":["كل مزايا VIP 2","صور متحركة حتى 5 ميجابايت","أولوية الدعم"]}}, "chat_enabled": True, "moments_enabled": True},
     }
@@ -2541,7 +2541,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v169", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v172", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2934,7 +2934,7 @@ def platform_owner_sound_file():
 
 @app.get("/api/platform/health")
 def platform_health():
-    return {"ok": True, "service": "PHANTOM ELITE", "release": "v169", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v172", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
 
 
 @app.get("/api/platform/apps")
@@ -2948,6 +2948,12 @@ def platform_apps(authorization: Optional[str] = Header(default=None)):
             if str(app.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(app.get("name", "")), re.I):
                 app.setdefault("active", True)
                 app.setdefault("engine", "FARM")
+    for app in apps:
+        try:
+            seconds = int(app.get("round_seconds", 29))
+        except (TypeError, ValueError):
+            seconds = 29
+        app["round_seconds"] = seconds if 1 <= seconds <= 3600 else 29
     return {"ok": True, "apps": apps, "engine": "FARM"}
 
 
@@ -3721,27 +3727,99 @@ def platform_admin_delete_moment(moment_id: str, authorization: Optional[str] = 
     return {"ok": True}
 
 
+def _platform_app_round_seconds(value: Any, default: int = 29) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail="مدة الجولة يجب أن تكون رقمًا صحيحًا بين 1 و3600 ثانية.")
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="مدة الجولة يجب أن تكون رقمًا صحيحًا بين 1 و3600 ثانية.")
+    if str(value).strip() not in {str(seconds), f"{seconds}.0"} or not 1 <= seconds <= 3600:
+        raise HTTPException(status_code=400, detail="مدة الجولة يجب أن تكون رقمًا صحيحًا بين 1 و3600 ثانية.")
+    return seconds
+
+
+def _platform_app_name_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _platform_app_slug(value: Any) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").casefold().strip())
+    slug = re.sub(r"[-_]{2,}", "-", slug).strip("-_")[:40]
+    return slug
+
+
+@app.get("/api/platform/admin/apps")
+def platform_admin_list_apps(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    with _platform_lock:
+        apps = []
+        for raw in platform_state.get("apps", []):
+            item = dict(raw)
+            try:
+                seconds = int(item.get("round_seconds", 29))
+            except (TypeError, ValueError):
+                seconds = 29
+            item["round_seconds"] = seconds if 1 <= seconds <= 3600 else 29
+            item.setdefault("active", True)
+            apps.append(item)
+        apps.sort(key=lambda a: (str(a.get("name", "")).casefold() != "hi fami", str(a.get("name", "")).casefold()))
+    return {"ok": True, "apps": apps}
+
+
 @app.post("/api/platform/admin/apps")
 def platform_admin_add_app(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     actor = _platform_require_admin(authorization)
     name = str(payload.get("name", "")).strip()
-    app_id = re.sub(r"[^a-z0-9_-]+", "", str(payload.get("id", name.casefold().replace(" ", "-"))).casefold())[:40]
-    if len(app_id) < 2: app_id = "app-" + secrets.token_hex(4)
-    if len(name) < 2 or len(name) > 60: raise HTTPException(status_code=400, detail="اسم التطبيق غير صالح.")
+    if len(name) < 2 or len(name) > 60:
+        raise HTTPException(status_code=400, detail="اسم التطبيق غير صالح.")
+    supplied_id = str(payload.get("id", "")).strip()
+    app_id = _platform_app_slug(supplied_id or name) or ("app-" + secrets.token_hex(4))
+    if len(app_id) < 2:
+        app_id = "app-" + secrets.token_hex(4)
+    icon_url = str(payload.get("icon_url", "")).strip()
+    game_image_url = str(payload.get("game_image_url", "")).strip()
+    if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+    if game_image_url and (len(game_image_url) > 500 or not game_image_url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="رابط صورة المزرعة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
+    round_seconds = _platform_app_round_seconds(payload.get("round_seconds", 29))
+    name_key = _platform_app_name_key(name)
     with _platform_lock:
-        if any(a.get("id") == app_id or a.get("name", "").casefold() == name.casefold() for a in platform_state.get("apps", [])):
-            raise HTTPException(status_code=409, detail="التطبيق أو المعرّف موجود بالفعل.")
-        icon_url = str(payload.get("icon_url", "")).strip()
-        if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
-            raise HTTPException(status_code=400, detail="رابط الأيقونة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
-        game_image_url = str(payload.get("game_image_url", "")).strip()
-        if game_image_url and (len(game_image_url) > 500 or not game_image_url.startswith("https://")):
-            raise HTTPException(status_code=400, detail="رابط صورة المزرعة يجب أن يكون HTTPS وبطول لا يتجاوز 500 حرف.")
-        item = {"id": app_id, "name": name, "active": True, "engine": "FARM", "icon_url": icon_url, "game_image_url": game_image_url, "created_by_admin": True}
-        platform_state.setdefault("apps", []).append(item)
-        _platform_audit(actor, "APP_ADD", app_id, name)
+        apps = platform_state.setdefault("apps", [])
+        existing_by_name = next((a for a in apps if _platform_app_name_key(a.get("name")) == name_key), None)
+        existing_by_id = next((a for a in apps if str(a.get("id", "")).casefold() == app_id.casefold()), None)
+        if existing_by_name:
+            # An old/stale catalog record can exist while being hidden from the user's visible list.
+            # Restore it instead of showing the misleading generic duplicate error.
+            existing_by_name["name"] = name
+            existing_by_name["active"] = True
+            existing_by_name["engine"] = "FARM"
+            existing_by_name["created_by_admin"] = True
+            existing_by_name["round_seconds"] = round_seconds
+            if icon_url:
+                existing_by_name["icon_url"] = icon_url
+            else:
+                existing_by_name.setdefault("icon_url", "")
+            if game_image_url:
+                existing_by_name["game_image_url"] = game_image_url
+            else:
+                existing_by_name.setdefault("game_image_url", "")
+            _platform_audit(actor, "APP_RESTORE_OR_UPDATE", str(existing_by_name.get("id", app_id)), name)
+            _platform_save_state()
+            return {"ok": True, "app": existing_by_name, "restored": True,
+                    "message": "كان هناك سجل سابق غير ظاهر للتطبيق؛ تم إظهاره وتفعيله بدل إنشاء نسخة مكررة."}
+        if existing_by_id:
+            current_name = str(existing_by_id.get("name", existing_by_id.get("id", "تطبيق آخر")))
+            raise HTTPException(status_code=409, detail=f"المعرّف '{app_id}' مستخدم بالفعل للتطبيق '{current_name}'. غيّر الاسم لتوليد معرّف مختلف.")
+        item = {"id": app_id, "name": name, "active": True, "engine": "FARM", "round_seconds": round_seconds,
+                "icon_url": icon_url, "game_image_url": game_image_url, "created_by_admin": True}
+        apps.append(item)
+        _platform_audit(actor, "APP_ADD", app_id, json.dumps({"name": name, "round_seconds": round_seconds}, ensure_ascii=False))
         _platform_save_state()
-    return {"ok": True, "app": item}
+    return {"ok": True, "app": item, "restored": False, "message": "تمت إضافة التطبيق."}
 
 
 @app.patch("/api/platform/admin/apps/{app_id}")
@@ -3750,7 +3828,19 @@ def platform_admin_app_update(app_id: str, payload: Dict[str, Any], authorizatio
     with _platform_lock:
         app_item = next((a for a in platform_state.get("apps", []) if a.get("id") == app_id), None)
         if not app_item: raise HTTPException(status_code=404, detail="التطبيق غير موجود.")
-        if "active" in payload: app_item["active"] = bool(payload["active"])
+        is_builtin_hifami = str(app_item.get("id", "")).casefold() == "hifami" or re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(app_item.get("name", "")), re.I)
+        if "active" in payload:
+            app_item["active"] = bool(payload["active"])
+        # Editing/activating a legacy hidden record makes it an explicitly managed catalog app.
+        if not is_builtin_hifami and any(key in payload for key in ("active", "round_seconds", "icon_url", "game_image_url")):
+            app_item["created_by_admin"] = True
+        if "round_seconds" in payload:
+            app_item["round_seconds"] = _platform_app_round_seconds(payload.get("round_seconds"))
+        else:
+            try:
+                app_item["round_seconds"] = _platform_app_round_seconds(app_item.get("round_seconds", 29))
+            except HTTPException:
+                app_item["round_seconds"] = 29
         if "icon_url" in payload:
             icon_url = str(payload.get("icon_url", "")).strip()
             if icon_url and (len(icon_url) > 500 or not icon_url.startswith("https://")):
@@ -3905,6 +3995,117 @@ def root():
             "/api/license/verify",
         ],
     }
+
+
+# V172: small animated profile-badge catalog and safe app removal.
+_PLATFORM_V172_DEFAULT_PROFILE_BADGES = [
+    {"id": "phantom-elite", "name": "Phantom Elite", "symbol": "✦", "color": "#c69cff", "accent": "#4ce8ff", "shape": "diamond", "motion": "shimmer", "rarity": "legendary", "active": True},
+    {"id": "vip-aurora", "name": "VIP Aurora", "symbol": "V", "color": "#ffe08a", "accent": "#a879ff", "shape": "shield", "motion": "pulse", "rarity": "epic", "active": True},
+    {"id": "cosmic-orbit", "name": "Cosmic Orbit", "symbol": "✧", "color": "#68f4eb", "accent": "#9c81ff", "shape": "orbit", "motion": "orbit", "rarity": "epic", "active": True},
+    {"id": "shadow-flare", "name": "Shadow Flare", "symbol": "✹", "color": "#ff82d5", "accent": "#6d7cff", "shape": "flare", "motion": "spin", "rarity": "mythic", "active": True},
+]
+_PLATFORM_V172_BADGE_SHAPES = {"diamond", "hexagon", "shield", "orb", "star", "ring", "flare"}
+_PLATFORM_V172_BADGE_MOTIONS = {"pulse", "spin", "shimmer", "float", "orbit"}
+_PLATFORM_V172_BADGE_RARITIES = {"common", "rare", "epic", "legendary", "mythic"}
+
+
+def _platform_v172_profile_badges() -> List[Dict[str, Any]]:
+    settings = platform_state.setdefault("settings", {})
+    saved = settings.get("profile_badge_catalog")
+    source = _PLATFORM_V172_DEFAULT_PROFILE_BADGES if saved is None else saved
+    return [dict(item) for item in source if isinstance(item, dict)] if isinstance(source, list) else []
+
+
+def _platform_v172_normalize_badges(raw_badges: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_badges, list):
+        raise HTTPException(status_code=400, detail="قائمة الأوسمة غير صالحة.")
+    if len(raw_badges) > 30:
+        raise HTTPException(status_code=400, detail="الحد الأقصى 30 وسامًا.")
+    out: List[Dict[str, Any]] = []
+    seen_names = set()
+    seen_ids = set()
+    for index, raw in enumerate(raw_badges):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="بيانات أحد الأوسمة غير صالحة.")
+        name = str(raw.get("name", "")).strip()
+        symbol = str(raw.get("symbol", "✦")).strip()
+        if not 2 <= len(name) <= 32:
+            raise HTTPException(status_code=400, detail="اسم الوسام يجب أن يكون من حرفين إلى 32 حرفًا.")
+        if not 1 <= len(symbol) <= 8:
+            raise HTTPException(status_code=400, detail="رمز الوسام يجب أن يكون من حرف إلى 8 أحرف.")
+        key = re.sub(r"[\s._-]+", "", name.casefold())
+        if key in seen_names:
+            raise HTTPException(status_code=409, detail="أسماء الأوسمة يجب أن تكون مختلفة.")
+        seen_names.add(key)
+        badge_id = re.sub(r"[^a-z0-9_-]+", "-", str(raw.get("id") or name).casefold()).strip("-_")[:40]
+        badge_id = badge_id or f"badge-{index+1}"
+        if badge_id in seen_ids:
+            raise HTTPException(status_code=409, detail="معرّفات الأوسمة يجب أن تكون مختلفة.")
+        seen_ids.add(badge_id)
+        color = str(raw.get("color", "#c69cff")).strip()
+        accent = str(raw.get("accent", "#4ce8ff")).strip()
+        for candidate in (color, accent):
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", candidate):
+                raise HTTPException(status_code=400, detail="لون الوسام يجب أن يكون بصيغة HEX مثل #C69CFF.")
+        shape = str(raw.get("shape", "diamond"))
+        motion = str(raw.get("motion", "shimmer"))
+        rarity = str(raw.get("rarity", "rare"))
+        if shape not in _PLATFORM_V172_BADGE_SHAPES:
+            raise HTTPException(status_code=400, detail="شكل الوسام غير مدعوم.")
+        if motion not in _PLATFORM_V172_BADGE_MOTIONS:
+            raise HTTPException(status_code=400, detail="حركة الوسام غير مدعومة.")
+        if rarity not in _PLATFORM_V172_BADGE_RARITIES:
+            raise HTTPException(status_code=400, detail="ندرة الوسام غير مدعومة.")
+        out.append({"id": badge_id, "name": name, "symbol": symbol, "color": color.lower(), "accent": accent.lower(),
+                    "shape": shape, "motion": motion, "rarity": rarity, "active": bool(raw.get("active", True))})
+    return out
+
+
+@app.get("/api/platform/profile-badges")
+def platform_profile_badges(authorization: Optional[str] = Header(default=None)):
+    _platform_find_session(authorization)
+    with _platform_lock:
+        badges = [b for b in _platform_v172_profile_badges() if b.get("active", True)]
+    return {"ok": True, "badges": badges}
+
+
+@app.get("/api/platform/admin/profile-badges")
+def platform_admin_profile_badges(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization)
+    with _platform_lock:
+        return {"ok": True, "badges": _platform_v172_profile_badges()}
+
+
+@app.patch("/api/platform/admin/profile-badges")
+def platform_admin_save_profile_badges(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    if str(actor.get("role", "")).upper() != "OWNER":
+        raise HTTPException(status_code=403, detail="إنشاء وتعديل تصاميم الأوسمة متاح للمالك فقط.")
+    badges = _platform_v172_normalize_badges(payload.get("badges"))
+    with _platform_lock:
+        settings = platform_state.setdefault("settings", {})
+        settings["profile_badge_catalog"] = badges
+        _platform_audit(actor, "PROFILE_BADGE_CATALOG_UPDATE", "profile_badge_catalog", f"count={len(badges)}")
+        _platform_save_state()
+    return {"ok": True, "badges": badges, "count": len(badges)}
+
+
+@app.delete("/api/platform/admin/apps/{app_id}")
+def platform_admin_delete_app(app_id: str, authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization)
+    with _platform_lock:
+        apps = platform_state.setdefault("apps", [])
+        index = next((i for i, app_item in enumerate(apps) if str(app_item.get("id", "")).casefold() == str(app_id).casefold()), None)
+        if index is None:
+            raise HTTPException(status_code=404, detail="التطبيق غير موجود أو تم حذفه بالفعل.")
+        app_item = apps[index]
+        is_builtin_hifami = str(app_item.get("id", "")).casefold() == "hifami" or bool(re.search(r"hi\s*fami|hifami|هاي\s*فامي", str(app_item.get("name", "")), re.I))
+        if is_builtin_hifami:
+            raise HTTPException(status_code=403, detail="تطبيق Hi Fami الأساسي محمي ولا يمكن حذفه.")
+        removed = apps.pop(index)
+        _platform_audit(actor, "APP_DELETE", str(removed.get("id", app_id)), str(removed.get("name", "")))
+        _platform_save_state()
+    return {"ok": True, "deleted": {"id": removed.get("id"), "name": removed.get("name")}}
 
 
 if __name__ == "__main__":
