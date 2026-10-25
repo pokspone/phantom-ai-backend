@@ -2444,6 +2444,28 @@ _platform_migrate_v161_state()
 _platform_last_saved_state = copy.deepcopy(platform_state)
 
 
+def _platform_registration_days(user: Dict[str, Any]) -> int:
+    """Return the public profile's registration-day display, with an optional owner override."""
+    override = user.get("registration_days_override")
+    if override is not None:
+        try:
+            value = int(override)
+            if 0 <= value <= 999:
+                return value
+        except (TypeError, ValueError):
+            pass
+    created = user.get("created_at")
+    if not created:
+        return 1
+    try:
+        dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(1, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() // 86400))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
 def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     # Backfill profile fields for accounts created by older builds so the profile UI never receives null/missing fields.
     username = str(user.get("username") or "عضو جديد")
@@ -2487,7 +2509,8 @@ def _platform_user_public(user: Dict[str, Any]) -> Dict[str, Any]:
     daily_limit = _platform_prediction_limit(user)
     return {"id": user.get("id"), "display_id": user.get("display_id", user.get("id")), "id_glow_enabled": bool(user.get("id_glow_enabled", False)), "username": user.get("username"), "role": user.get("role", "USER"),
             "profile": public_profile, "badges": user.get("badges", []), "featured": user.get("id") in platform_state.get("featured_user_ids", []), "vip": {**vip, "active": active_vip, "days_left": days_left, "tier": tier, "daily_predictions": daily_limit},
-            "created_at": user.get("created_at"), "last_active": user.get("last_active"), "banned": bool(user.get("banned")), "verified": bool(user.get("verified"))}
+            "created_at": user.get("created_at"), "registration_days": _platform_registration_days(user), "registration_days_override": user.get("registration_days_override"),
+            "last_active": user.get("last_active"), "banned": bool(user.get("banned")), "verified": bool(user.get("verified"))}
 
 
 def _platform_password_hash(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
@@ -2541,7 +2564,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v181", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v186", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2934,7 +2957,7 @@ def platform_owner_sound_file():
 
 @app.get("/api/platform/health")
 def platform_health():
-    return {"ok": True, "service": "PHANTOM ELITE", "release": "v181", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v186", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
 
 
 @app.get("/api/platform/apps")
@@ -3458,6 +3481,25 @@ def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorizat
             if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تفعيل إضاءة الـ ID متاح للمالك فقط.")
             if not isinstance(payload.get("id_glow_enabled"), bool): raise HTTPException(status_code=400, detail="قيمة إضاءة الـ ID يجب أن تكون true أو false.")
             changes["id_glow_enabled"] = payload["id_glow_enabled"]
+        if "registration_days_override" in payload:
+            if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تعديل عدد أيام العضوية الظاهر متاح للمالك فقط.")
+            raw_days = payload.get("registration_days_override")
+            if raw_days is None or raw_days == "":
+                changes["registration_days_override"] = None
+            else:
+                if isinstance(raw_days, bool):
+                    raise HTTPException(status_code=400, detail="عدد أيام العضوية يجب أن يكون رقمًا صحيحًا من 0 إلى 999.")
+                if isinstance(raw_days, int):
+                    registration_days = raw_days
+                elif isinstance(raw_days, float) and raw_days.is_integer():
+                    registration_days = int(raw_days)
+                elif isinstance(raw_days, str) and re.fullmatch(r"\d{1,3}", raw_days.strip()):
+                    registration_days = int(raw_days.strip())
+                else:
+                    raise HTTPException(status_code=400, detail="عدد أيام العضوية يجب أن يكون رقمًا صحيحًا من 0 إلى 999.")
+                if not 0 <= registration_days <= 999:
+                    raise HTTPException(status_code=400, detail="عدد أيام العضوية يجب أن يكون بين 0 و999 يومًا.")
+                changes["registration_days_override"] = registration_days
         if "display_id" in payload:
             if actor.get("role") != "OWNER": raise HTTPException(status_code=403, detail="تخصيص الآيدي المميز للمالك فقط.")
             custom_id = str(payload.get("display_id", "")).strip()
@@ -3489,6 +3531,11 @@ def platform_admin_update_user(user_id: str, payload: Dict[str, Any], authorizat
             target["badges"] = [{"name": str(b.get("name", ""))[:60], "rarity": str(b.get("rarity", "rare"))[:30]} for b in badges[:50] if isinstance(b, dict) and str(b.get("name", "")).strip()]
         if "display_id" in changes: target["display_id"] = changes["display_id"]
         if "id_glow_enabled" in changes: target["id_glow_enabled"] = changes["id_glow_enabled"]
+        if "registration_days_override" in changes:
+            if changes["registration_days_override"] is None:
+                target.pop("registration_days_override", None)
+            else:
+                target["registration_days_override"] = changes["registration_days_override"]
         if profile_changes: target.setdefault("profile", {}).update(profile_changes)
         if "password" in changes:
             salt, digest = _platform_password_hash(changes["password"])
@@ -3597,6 +3644,61 @@ def platform_admin_delete_sound(user_id: str, authorization: Optional[str] = Hea
         _platform_audit(actor, "USER_SOUND_DELETE", str(target.get("id")))
         _platform_save_state()
         return {"ok": True, "user": _platform_user_public(target)}
+
+
+@app.post("/api/platform/admin/users/{user_id}/manual-vip")
+def platform_admin_manual_vip(user_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    """Owner-only complimentary VIP grant for exactly 1, 3, or 7 days.
+
+    Separate from public checkout, plan pricing, and subscription-code redemption.
+    The selected tier takes effect immediately and replaces any currently active tier.
+    """
+    actor = _platform_require_admin(authorization)
+    if str(actor.get("role", "")).upper() != "OWNER":
+        raise HTTPException(status_code=403, detail="تفعيل VIP اليدوي متاح لمالك المنصة فقط.")
+    tier = str(payload.get("tier", "")).strip().lower()
+    if tier not in {"vip1", "vip2", "vip3"}:
+        raise HTTPException(status_code=400, detail="اختر مستوى VIP 1 أو VIP 2 أو VIP 3.")
+    raw_days = payload.get("days")
+    if isinstance(raw_days, bool):
+        raise HTTPException(status_code=400, detail="المدة المسموحة يوم أو 3 أيام أو 7 أيام فقط.")
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="المدة المسموحة يوم أو 3 أيام أو 7 أيام فقط.")
+    if str(raw_days).strip() not in {"1", "3", "7"} or days not in {1, 3, 7}:
+        raise HTTPException(status_code=400, detail="المدة المسموحة يوم أو 3 أيام أو 7 أيام فقط.")
+    with _platform_lock:
+        _, target = _platform_find_user_entry(user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+        prior = target.get("vip") if isinstance(target.get("vip"), dict) else {}
+        was_active = _platform_vip_active(target)
+        prior_tier = _platform_vip_tier(target) if was_active else 0
+        now = datetime.now(timezone.utc)
+        expires = datetime.fromtimestamp(now.timestamp() + days * 86400, timezone.utc)
+        settings = platform_state.setdefault("settings", {})
+        plans = settings.setdefault("vip_plans", _platform_default_state()["settings"]["vip_plans"])
+        plan = plans.get(tier) if isinstance(plans, dict) else None
+        plan_name = str((plan or {}).get("name") or tier.upper())[:60]
+        target["vip"] = {
+            "active": True,
+            "plan_days": days,
+            "plan_id": tier,
+            "plan_name": plan_name,
+            "started_at": now.isoformat().replace("+00:00", "Z"),
+            "expires_at": expires.isoformat().replace("+00:00", "Z"),
+            "activated_by_admin": True,
+            "grant_source": "owner_manual",
+            "granted_by_user_id": actor.get("id"),
+            "granted_by_username": actor.get("username", "OWNER"),
+        }
+        details = {"tier": tier, "days": days, "source": "owner_manual", "previous_tier": prior_tier,
+                   "replaced_active_vip": bool(was_active), "expires_at": target["vip"]["expires_at"]}
+        _platform_audit(actor, "VIP_MANUAL_GRANT", str(target.get("id")), json.dumps(details, ensure_ascii=False))
+        _platform_save_state()
+        return {"ok": True, "message": f"تم تفعيل {tier.upper()} لمدة {days} يومًا للمستخدم @{target.get('username', '')}.",
+                "user": _platform_user_public(target), "grant": details}
 
 
 @app.post("/api/platform/admin/vip")
