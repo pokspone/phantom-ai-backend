@@ -2541,7 +2541,7 @@ def _platform_audit(actor: Dict[str, Any], action: str, target: str = "", detail
 
 @app.get("/api/platform/release")
 def platform_release_info():
-    return {"app": "PHANTOM ELITE", "release": "v158", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
+    return {"app": "PHANTOM ELITE", "release": "v162", "prediction_engine": "FARM_WHEEL_EXCLUSION", "round_seconds": 29, "free_exclusions": 3, "vip_exclusions": 4, "retired_engines": ["DRAGON_TIGER", "POKER"], "auth_system": "platform_state"}
 
 
 @app.post("/api/platform/auth/signup")
@@ -2934,7 +2934,7 @@ def platform_owner_sound_file():
 
 @app.get("/api/platform/health")
 def platform_health():
-    return {"ok": True, "service": "PHANTOM ELITE", "release": "v158", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
+    return {"ok": True, "service": "PHANTOM ELITE", "release": "v162", "catalog": True, "owner_sound_fallback": os.path.isfile(PLATFORM_OWNER_SOUND_FILE)}
 
 
 @app.get("/api/platform/apps")
@@ -3080,9 +3080,13 @@ def platform_support_send(payload: Dict[str, Any], authorization: Optional[str] 
 
 @app.get("/api/platform/admin/support/messages")
 def platform_admin_support_messages(authorization: Optional[str] = Header(default=None)):
-    _platform_require_admin(authorization, allow_moderator=True)
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    is_owner = str(actor.get("role", "")).upper() == "OWNER"
     with _platform_lock:
         rows = list(platform_state.get("support_messages", []))
+        # Owner conversations are private: moderators/admins may work on support only.
+        if not is_owner:
+            rows = [r for r in rows if str(r.get("recipient", "support")).lower() != "owner"]
         users = {u.get("id"): _platform_user_public(u) for u in platform_state.get("users", {}).values()}
         grouped = {}
         for row in rows:
@@ -3090,16 +3094,41 @@ def platform_admin_support_messages(authorization: Optional[str] = Header(defaul
             grouped.setdefault((row.get("user_id"), channel), []).append(row)
         conversations = []
         for (uid, channel), msgs in grouped.items():
-            user = users.get(uid, {})
+            public_user = users.get(uid, {})
             raw_user = next((u for u in platform_state.get("users", {}).values() if u.get("id") == uid), {})
             vip_tier = _platform_vip_tier(raw_user) if raw_user else 0
+            unread_count = sum(1 for m in msgs if m.get("sender_role") == "user" and not m.get("read", False))
             conversations.append({"user_id": uid, "recipient": channel, "recipient_name": "المالك • Super Admin" if channel == "owner" else "خدمة العملاء",
-                                 "username": user.get("username", msgs[0].get("username", "مستخدم")),
-                                 "display_name": (user.get("profile") or {}).get("display_name", ""),
+                                 "username": public_user.get("username", msgs[0].get("username", "مستخدم")),
+                                 "display_name": (public_user.get("profile") or {}).get("display_name", ""),
+                                 "avatar": (public_user.get("profile") or {}).get("avatar", ""),
+                                 "verified": bool(public_user.get("verified")), "display_id": public_user.get("display_id", ""),
+                                 "profile": public_user.get("profile", {}), "public_user": public_user,
                                  "vip_tier": vip_tier, "priority": "قصوى" if vip_tier >= 3 else "عالية" if vip_tier == 2 else "سريعة" if vip_tier == 1 else "عادية",
+                                 "unread_count": unread_count, "last_message": msgs[-1],
                                  "messages": msgs[-500:], "last_at": msgs[-1].get("created_at", "")})
-        conversations.sort(key=lambda c: (int(c.get("vip_tier", 0)), c.get("last_at", "")), reverse=True)
+        conversations.sort(key=lambda c: (int(c.get("unread_count", 0) > 0), int(c.get("vip_tier", 0)), c.get("last_at", "")), reverse=True)
         return {"ok": True, "conversations": conversations}
+
+
+@app.post("/api/platform/admin/support/messages/read")
+def platform_admin_support_mark_read(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    actor = _platform_require_admin(authorization, allow_moderator=True)
+    user_id = str(payload.get("user_id", "")).strip()
+    recipient = str(payload.get("recipient", "support") or "support").strip().lower()
+    if not user_id or recipient not in {"owner", "support"}:
+        raise HTTPException(status_code=400, detail="المحادثة المطلوبة غير صالحة.")
+    if recipient == "owner" and str(actor.get("role", "")).upper() != "OWNER":
+        raise HTTPException(status_code=403, detail="محادثات المالك خاصة بحساب OWNER فقط.")
+    with _platform_lock:
+        changed = 0
+        for row in platform_state.get("support_messages", []):
+            if str(row.get("user_id")) == user_id and str(row.get("recipient", "support")).lower() == recipient and row.get("sender_role") == "user" and not row.get("read", False):
+                row["read"] = True
+                changed += 1
+        if changed:
+            _platform_save_state()
+        return {"ok": True, "marked_read": changed}
 
 
 @app.post("/api/platform/admin/support/messages")
@@ -3739,6 +3768,15 @@ def platform_admin_app_update(app_id: str, payload: Dict[str, Any], authorizatio
         return {"ok": True, "app": app_item}
 
 
+@app.get("/api/platform/admin/settings")
+def platform_admin_get_settings(authorization: Optional[str] = Header(default=None)):
+    _platform_require_admin(authorization, allow_moderator=True)
+    settings = platform_state.get("settings", {})
+    return {"ok": True, "settings": {key: settings.get(key, default) for key, default in {
+        "chat_enabled": True, "moments_enabled": True, "sound_enabled": True, "theme": "royal-dark"
+    }.items()}}
+
+
 @app.patch("/api/platform/admin/settings")
 def platform_admin_settings(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     actor = _platform_require_admin(authorization)
@@ -3776,6 +3814,37 @@ def platform_prediction_usage(authorization: Optional[str] = Header(default=None
     return {"ok": True, "usage": _platform_prediction_usage(user)}
 
 
+@app.post("/api/platform/predictions/consume")
+def platform_prediction_consume(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
+    """Reserve one VIP wheel prediction without running server-side prediction analysis."""
+    user = _platform_find_session(authorization)
+    try:
+        history_count = max(0, min(100, int(payload.get("history_count", 0) or 0)))
+    except (TypeError, ValueError):
+        history_count = 0
+    reservation = _platform_reserve_vip_prediction(user)
+    try:
+        with _platform_lock:
+            logs = platform_state.setdefault("vip_prediction_logs", [])
+            logs.append({
+                "id": secrets.token_hex(8),
+                "user_id": user.get("id"),
+                "username": user.get("username"),
+                "tier": _platform_vip_tier(user),
+                "date": reservation.get("date", _platform_cairo_date()),
+                "created_at": _platform_now(),
+                "history_count": history_count,
+                "source": "wheel_local_exclusion",
+                "mode": "VIP",
+            })
+            platform_state["vip_prediction_logs"] = logs[-20000:]
+            _platform_save_state()
+        return {"ok": True, "message": "تم احتساب توقع VIP.", "usage": _platform_prediction_usage(user)}
+    except Exception:
+        _platform_rollback_vip_prediction(user, reservation.get("date", _platform_cairo_date()))
+        raise
+
+
 @app.post("/api/platform/predict")
 async def platform_predict(payload: Dict[str, Any], authorization: Optional[str] = Header(default=None)):
     user = _platform_find_session(authorization)
@@ -3805,6 +3874,19 @@ async def platform_predict(payload: Dict[str, Any], authorization: Optional[str]
         _platform_rollback_vip_prediction(user, usage_date)
         raise
 
+
+
+@app.get("/api/platform/predictions/history")
+def platform_prediction_history(limit: int = 50, authorization: Optional[str] = Header(default=None)):
+    user = _platform_find_session(authorization)
+    try:
+        limit = max(1, min(100, int(limit)))
+    except (TypeError, ValueError):
+        limit = 50
+    with _platform_lock:
+        rows = [row for row in platform_state.get("vip_prediction_logs", []) if str(row.get("user_id")) == str(user.get("id"))]
+        rows.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+        return {"ok": True, "history": rows[:limit], "count": len(rows)}
 
 
 @app.get("/")
